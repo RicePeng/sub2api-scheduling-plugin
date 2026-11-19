@@ -1,0 +1,23 @@
+/dist/
+/build/
+/.test-artifacts/
+/.playwright-mcp/
+/playwright-report/
+/test-results/
+/coverage.out
+/tests/ui-*.png
+
+# Local credentials and machine-specific configuration.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+
+# Dependencies, binaries, and local tool output.
+node_modules/
+*.s2plugin
+*.test
+*.log
+.DS_Store
+Thumbs.db

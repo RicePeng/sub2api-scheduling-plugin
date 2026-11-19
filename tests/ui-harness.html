@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>仅测试：插件 Bridge 宿主</title><style>body{margin:0}iframe{display:block;width:100%;height:100vh;border:0}</style></head>
+<body><iframe id="plugin" title="测试用插件配置" sandbox="allow-scripts"></iframe>
+<script>
+'use strict';
+// Test fixtures only. This harness is not included in the production ui/ assets.
+window.mock = {
+  requests: [], holdTypes: [], rejectTypes: [], config: { upstream_rates_enabled: false },
+  snapshot: { version: '0.1.0-test', hostname: 'test-executor-01', mode: 'unconfigured', storage_ready: true,
+    sampling_since: '2026-11-18T00:00:00Z', polling: false,
+    last_poll: '', next_poll: '', error: '', accounts: [], events: [] },
+};
+const frame = document.getElementById('plugin');
+window.respond = (request, payload) => frame.contentWindow.postMessage({ source: 'sub2api-plugin-host',
+  bridge_token: 'ui-test-token', request_id: request.request_id, type: `${request.type}.result`, ok: true, ...payload }, '*');
+window.addEventListener('message', (event) => {
+  const message = event.data;
+  if (event.source !== frame.contentWindow || !message || message.source !== 'sub2api-plugin-ui' || message.bridge_token !== 'ui-test-token') return;
+  window.mock.requests.push(message);
+  if (!message.request_id || window.mock.holdTypes.includes(message.type)) return;
+  if (window.mock.rejectTypes.includes(message.type)) { window.respond(message, { ok: false, error: 'ui-secret-canary: permission denied' }); return; }
+  if (message.type === 'config.load') window.respond(message, { config: window.mock.config });
+  if (message.type === 'config.save') { window.mock.config = message.config; window.respond(message, { config: message.config }); }
+  if (message.type === 'config.test') {
+    if (window.mock.config.automation_enabled) {
+      window.mock.snapshot.polling = true;
+      window.mock.snapshot.next_poll = null;
+    }
+    window.respond(message, { result: { success: true, message: 'ui-secret-canary', status_json: JSON.stringify(window.mock.snapshot) } });
+  }
+  if (message.type === 'plugin.status') window.respond(message, { result: { healthy: true, message: 'ui-secret-canary', status_json: JSON.stringify(window.mock.snapshot) } });
+});
+frame.src = `../ui/index.html?run=${Date.now()}#bridge_token=ui-test-token`;
+</script></body></html>

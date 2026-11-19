@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="294" viewBox="0 0 960 294" role="img" aria-labelledby="title desc">
+  <title id="title">Sub2API 账号调用管理</title>
+  <desc id="desc">采集 API Key 账号的缓存比例、首字时间和倍率，按组评估规则，再按优秀、良好、一般、备用的顺序调度。</desc>
+  <defs>
+    <linearGradient id="background" x2="1" y2="1">
+      <stop stop-color="#102b33"/>
+      <stop offset="1" stop-color="#172138"/>
+    </linearGradient>
+    <marker id="arrow" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto">
+      <path d="M0 0 7 4 0 8" fill="none" stroke="#7bb9b8" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+  </defs>
+  <rect width="960" height="294" rx="18" fill="url(#background)"/>
+  <g font-family="system-ui,'Microsoft YaHei','PingFang SC','Noto Sans CJK SC',sans-serif">
+    <text x="34" y="42" fill="#93d6cc" font-size="16" font-weight="600" letter-spacing="1">Sub2API</text>
+    <text x="34" y="83" fill="#f3fffd" font-size="32" font-weight="700">账号调用管理</text>
+
+    <g fill="#1b3540" stroke="#3d626e">
+      <rect x="34" y="112" width="240" height="152" rx="12"/>
+      <rect x="320" y="112" width="240" height="152" rx="12"/>
+      <rect x="606" y="112" width="320" height="152" rx="12"/>
+    </g>
+    <g fill="#f3fffd" font-size="20" font-weight="650">
+      <text x="54" y="151">采集调用指标</text>
+      <text x="340" y="151">评估分组规则</text>
+      <text x="626" y="151">按固定顺序调度</text>
+    </g>
+    <g fill="#c2d9df" font-size="17">
+      <text x="54" y="193">缓存命中比例</text>
+      <text x="54" y="223">首字时间与倍率</text>
+      <text x="340" y="193">每组独立设置阈值</text>
+      <text x="340" y="223">异常冷却后重新采样</text>
+    </g>
+    <g fill="none" stroke="#7bb9b8" stroke-width="1.5" marker-end="url(#arrow)">
+      <path d="M283 188h26"/>
+      <path d="M569 188h26"/>
+    </g>
+    <rect x="626" y="172" width="280" height="35" rx="6" fill="#244d50"/>
+    <text x="766" y="195" text-anchor="middle" fill="#d1ffef" font-size="17" font-weight="600">优秀 → 良好 → 一般 → 备用</text>
+    <text x="626" y="235" fill="#c2d9df" font-size="16">临时组不参与自动调度</text>
+  </g>
+</svg>

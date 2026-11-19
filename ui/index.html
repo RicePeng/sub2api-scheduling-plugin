@@ -1,0 +1,214 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>账号调用管理</title>
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="assets/styles.css">
+  <script src="assets/app.js" defer></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar" id="top">
+      <a class="brand" href="#top" aria-label="账号管理与监控首页">
+        <span class="brand-mark">S</span>
+        <span>账号调用管理</span>
+      </a>
+      <div class="topbar-right">
+        <span class="preview-tag"><span class="preview-dot"></span><span id="bridge-state">正在连接宿主</span></span>
+      </div>
+    </header>
+
+    <main>
+      <section class="intro">
+        <div>
+          <div class="eyebrow">SUB2API / API KEY</div>
+          <h1>账号管理与监控</h1>
+          <p class="lede">账号分组、运行指标、自动化规则和连接状态。</p>
+        </div>
+        <div class="runtime-state"><span class="state-indicator"></span><span>插件管理</span><span class="separator">|</span><span id="automation-status">待设置账号倍率</span></div>
+      </section>
+      <p id="action-message" class="inline-error" role="status" aria-live="polite" hidden></p>
+
+      <nav class="section-nav" aria-label="页面目录">
+        <label class="platform-switch">平台 <select id="platform-select" aria-label="平台种类"><option value="unknown">待识别</option></select></label>
+        <a class="active" aria-current="page" href="#view-monitor">账号监控</a>
+        <a href="#view-groups">账号管理 <span class="tab-count" id="account-count">0</span></a>
+        <a href="#view-rules">监控规则</a>
+        <a href="#view-connection">管理连接与运行状态</a>
+      </nav>
+
+      <section class="view" id="view-groups" aria-labelledby="groups-heading">
+        <div class="view-heading">
+          <div><h2 id="groups-heading">账号管理</h2><p>添加账号、调整所属组和倍率、设置组内是否参与调用。</p></div>
+          <div class="group-view-actions">
+            <button class="automation-action is-off" id="automation-toggle" type="button" disabled title="先保存管理连接并添加账号">启用</button>
+            <div class="sort-control"><span>组内倍率排序</span><select id="sort-direction" aria-label="组内倍率排序方向"><option value="asc">低 → 高</option><option value="desc">高 → 低</option></select></div>
+            <div id="add-account-form" class="add-account-form">
+              <label class="sr-only" for="new-account-id">账号 ID</label>
+              <input id="new-account-id" name="account_id" inputmode="numeric" pattern="[0-9]+" placeholder="输入账号 ID" aria-describedby="add-account-error" disabled>
+              <button class="button primary" id="add-account-button" type="button" disabled>添加 ID 到临时组</button>
+            </div>
+          </div>
+        </div>
+        <p class="inline-error" id="add-account-error" role="status" hidden></p>
+
+        <div id="groups-list" class="groups-list" aria-live="polite"></div>
+      </section>
+
+      <section class="view" id="view-monitor" aria-labelledby="monitor-heading">
+        <div class="view-heading">
+          <div><h2 id="monitor-heading">账号监控</h2><p>按调用组查看账号状态、采样数据和不可调用原因。</p></div>
+          <div class="monitor-refresh"><span class="state-indicator"></span><span id="monitor-poll-label">采样未启用</span><span id="monitor-countdown" class="monitor-countdown">未启用请求</span><button id="manual-poll" class="button manual-poll-button" type="button" disabled>手动请求</button></div>
+        </div>
+        <section class="account-overview" aria-labelledby="account-overview-heading">
+          <div class="overview-heading"><h3 id="account-overview-heading">账号运行情况</h3></div>
+          <dl class="overview-metrics">
+            <div class="overview-stat"><dt>监控账号</dt><dd id="overview-total">0</dd></div>
+            <div class="overview-stat callable"><dt>可调用</dt><dd id="overview-callable">0</dd></div>
+            <div class="overview-stat exceptional"><dt>不可调用区</dt><dd id="overview-exception">0</dd></div>
+            <div class="overview-stat needs-rate"><dt>待设置倍率</dt><dd id="overview-needs-rate">0</dd></div>
+          </dl>
+        </section>
+        <div class="route-strip" aria-label="当前调用顺序" hidden>
+          <span class="route-label">调用顺序</span>
+          <div id="route-order" class="route-order"></div>
+        </div>
+        <p id="monitor-empty" class="monitor-group-empty">当前平台暂无调用组账号</p>
+        <div id="monitor-group-list" class="monitor-group-list"></div>
+        <template id="monitor-table-template">
+          <div class="monitor-table-frame">
+            <table class="account-table monitor-table">
+              <thead><tr><th scope="col">账号</th><th scope="col">采用倍率</th><th scope="col">调度情况</th><th scope="col">缓存比例</th><th scope="col">采样</th><th scope="col">平均首字时间</th><th scope="col">运行状态</th></tr></thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </template>
+      </section>
+
+      <section class="view" id="view-rules" aria-labelledby="rules-heading">
+        <div class="view-heading"><div><h2 id="rules-heading">分组异常条件</h2><p>优秀、良好、一般、备用四组分别设置优先级与异常条件；临时组不参与调用。</p></div><span class="runtime-pill" id="rules-platform">四组独立设置</span></div>
+        <p class="rules-sampling-note">首字时间取最近 20 次有效调用的平均值，不足 20 次不触发；缓存取最近 20 次调用。任一条件连续命中后停用，到期重新尝试，旧样本不会立即再次触发。</p>
+        <div class="rule-layout group-rules-list" id="group-rules-list"></div>
+        <div class="rule-layout shared-rules">
+          <section class="rule-section">
+            <div class="rule-section-head"><div><h3>采集设置</h3><p>采集间隔和管理连接为插件共用设置。</p></div></div>
+            <div class="setting-row setting-row-input"><div><strong>采集间隔</strong><span>后台刷新真实调用指标。</span></div><div class="unit-input"><input id="poll-seconds" type="number" min="15" max="3600" value="60"><span>秒</span></div></div>
+            <div class="setting-row setting-row-input"><div><strong>管理请求超时</strong><span>单次管理 API 请求的等待时间。</span></div><div class="unit-input"><input id="timeout-seconds" type="number" min="3" max="120" value="15"><span>秒</span></div></div>
+          </section>
+          <section class="rule-section"><div class="rule-section-head"><div><h3>调用顺序</h3><p>上组全部不可用时，才开放下一组。</p></div></div><div class="flow-steps" id="flow-steps"></div><p class="rule-footnote">第五组临时不参与调用。启用自动管理后，同步各组优先级并控制调度开关。</p></section>
+        </div>
+        <div class="preview-actions"><p id="save-message" role="status">四个调用组的设置按平台独立保存，临时组固定关闭调度、优先级 99。</p><button id="save-rules" type="button" class="button primary">保存规则</button></div>
+      </section>
+
+      <section class="view" id="view-connection" aria-labelledby="connection-heading">
+        <div class="view-heading"><div><h2 id="connection-heading">管理连接与运行状态</h2><p>管理 API 连接用于读取账号、用量和执行账号状态管理。</p></div></div>
+        <div class="connection-layout">
+          <section class="rule-section">
+            <div class="rule-section-head"><div><h3>管理连接</h3><p>凭证只在插件配置中维护。</p></div><span class="connection-badge">未连接</span></div>
+            <div class="connection-fields">
+              <label class="field-label" for="admin-url">管理 API 地址</label>
+              <input id="admin-url" type="url" placeholder="http://127.0.0.1:8080" autocomplete="url">
+              <p class="field-help">地址必须能从插件运行环境访问。Docker 部署请使用容器网络内可达的地址。</p>
+              <label class="field-label" for="admin-api-key">管理 API 密钥</label>
+              <input id="admin-api-key" type="password" placeholder="填写管理 API 密钥" autocomplete="new-password">
+            <div class="connection-actions"><span id="connection-message" role="status">等待宿主连接。</span><div class="button-group"><button id="test-connection" type="button" class="button">测试连接</button><button id="save-config" type="button" class="button primary">保存配置</button></div></div>
+            </div>
+          </section>
+          <section class="rule-section runtime-section">
+            <div class="rule-section-head"><div><h3>运行状态</h3><p>采集状态与自动管理状态。</p></div><span class="runtime-pill">插件</span></div>
+            <dl class="runtime-grid">
+              <div><dt>运行模式</dt><dd id="runtime-mode">未连接</dd></div>
+              <div><dt>恢复记录存储</dt><dd id="runtime-storage">—</dd></div>
+              <div><dt>插件版本</dt><dd id="runtime-version">0.1.0</dd></div>
+              <div><dt>最近采集</dt><dd id="runtime-last-poll">—</dd></div>
+              <div><dt>下次采集</dt><dd id="runtime-next-poll">—</dd></div>
+              <div><dt>当前平台</dt><dd id="runtime-platform">—</dd></div>
+            </dl>
+            <div class="runtime-footer"><span>监控账号</span><strong id="runtime-account-count">0</strong><span>自动管理</span><strong id="runtime-automation-state">未启用</strong></div>
+          </section>
+        </div>
+      </section>
+
+      <section class="view" id="view-events" aria-labelledby="events-heading">
+        <div class="view-heading"><div><h2 id="events-heading">操作记录</h2><p>自动管理、恢复和人工变更检测记录。</p></div><div class="event-heading-actions"><span class="runtime-pill">最近 50 条</span><button class="button event-clear-button" id="event-clear" type="button" disabled>清空记录</button></div></div>
+        <div class="event-table-frame">
+          <table class="event-table">
+            <thead><tr><th scope="col">时间</th><th scope="col">账号</th><th scope="col">操作</th><th scope="col">结果</th></tr></thead>
+            <tbody id="event-rows"></tbody>
+          </table>
+          <div class="empty-state" id="event-empty"><strong>暂无操作记录</strong><span>启用自动管理或检测到人工变更后，记录会显示在这里。</span></div>
+        </div>
+        <div class="event-pagination" id="event-pagination" hidden>
+          <button class="page-button" id="event-prev" type="button" aria-label="上一页" title="上一页">←</button>
+          <span id="event-page-label">第 1 / 1 页</span>
+          <button class="page-button" id="event-next" type="button" aria-label="下一页" title="下一页">→</button>
+        </div>
+      </section>
+
+      <footer class="footer-line"><span>仅管理显式添加的 API Key 账号；通过管理 API 读取与执行。</span><a href="#top">返回页面顶部</a></footer>
+    </main>
+  </div>
+  <textarea id="account-ids" hidden></textarea>
+  <input id="automation-enabled" type="checkbox" hidden>
+  <input id="collect-cache" type="checkbox" checked hidden>
+  <input id="window-minutes" type="hidden" value="15">
+  <input id="rate-source" type="hidden" value="account">
+  <input id="max-rate-multiplier" type="hidden" value="0">
+  <input id="min-cache-percent" type="hidden" value="80">
+  <input id="min-requests" type="hidden" value="20">
+  <input id="recovery-samples" type="hidden" value="3">
+  <input id="cooldown-seconds" type="hidden" value="300">
+  <input id="action" type="hidden" value="deprioritize">
+  <input id="priority-penalty" type="hidden" value="10">
+
+  <dialog id="account-dialog" class="account-dialog">
+    <form id="account-edit-form" novalidate>
+      <div class="dialog-head"><div><div class="eyebrow">账号信息</div><h2 id="dialog-title">编辑账号</h2></div><button class="icon-close" type="button" data-close-dialog aria-label="关闭">×</button></div>
+      <div class="identity-block"><div class="avatar-mark" id="dialog-avatar">A</div><div><strong id="dialog-name"></strong><span id="dialog-meta"></span></div><span class="status-pill" id="dialog-status"></span></div>
+      <label class="field-label" for="edit-group">调用分组</label>
+      <select id="edit-group" name="group_id"></select>
+      <fieldset class="rate-fieldset"><legend>倍率方式</legend>
+        <label class="radio-option"><input type="radio" name="rate_mode" value="upstream"><span><strong>读取上游倍率</strong><small id="dialog-upstream">当前上游倍率：—</small></span></label>
+        <label class="radio-option"><input type="radio" name="rate_mode" value="fixed"><span><strong>使用固定倍率</strong><small>手动设置并使用此倍率</small></span></label>
+        <div class="unit-input fixed-rate-input"><input id="edit-fixed-rate" aria-label="固定倍率" type="number" min="0" max="1000000" step="0.01" placeholder="填写固定倍率"><span>×</span></div>
+        <p class="dialog-error" id="edit-rate-error" role="status" hidden>选择固定倍率时，必须填写有效倍率。</p>
+      </fieldset>
+      <div class="dialog-actions"><button class="button" type="button" data-close-dialog>取消</button><button class="button primary" id="edit-save-button" type="button">保存修改</button></div>
+    </form>
+  </dialog>
+  <dialog id="runtime-detail-dialog" class="account-dialog runtime-detail-dialog" aria-labelledby="runtime-detail-title">
+    <section class="runtime-detail-panel">
+      <div class="dialog-head"><div><div class="eyebrow">运行详情</div><h2 id="runtime-detail-title">账号运行状态</h2></div><button class="icon-close" type="button" data-close-runtime aria-label="关闭">×</button></div>
+      <div class="identity-block"><div class="avatar-mark" id="runtime-detail-avatar">A</div><div><strong id="runtime-detail-name"></strong><span id="runtime-detail-meta"></span></div><span class="runtime-detail-status" id="runtime-detail-status"></span></div>
+      <dl class="runtime-detail-grid">
+        <div><dt>所属调用组</dt><dd id="runtime-detail-group"></dd></div>
+        <div><dt>宿主可调用性</dt><dd id="runtime-detail-host"></dd></div>
+        <div><dt>当前倍率</dt><dd id="runtime-detail-rate"></dd></div>
+        <div><dt>宿主优先级</dt><dd id="runtime-detail-priority"></dd></div>
+        <div><dt>缓存样本</dt><dd id="runtime-detail-cache"></dd></div>
+        <div><dt>首字时间样本</dt><dd id="runtime-detail-ttft"></dd></div>
+        <div hidden><dt>恢复安排</dt><dd id="runtime-detail-recovery"></dd></div>
+      </dl>
+      <div class="runtime-detail-note"><strong>状态说明</strong><p id="runtime-detail-reason"></p><p id="runtime-detail-error" hidden></p></div>
+      <div class="dialog-actions"><button class="button" type="button" data-close-runtime>关闭</button></div>
+    </section>
+  </dialog>
+  <dialog id="delete-account-dialog" class="delete-account-dialog">
+    <form id="delete-account-form">
+      <div class="dialog-head"><div><h2 id="delete-account-title">删除监控账号</h2></div><button class="icon-close" type="button" data-close-delete aria-label="关闭">×</button></div>
+      <p class="delete-account-copy">此操作只会从插件监控列表删除此账号，不会删除 Sub2API 中的源账号。</p>
+      <div class="dialog-actions"><button class="button" type="button" data-close-delete>取消</button><button class="button danger-action" id="delete-account-confirm" type="button">删除账号</button></div>
+    </form>
+  </dialog>
+  <dialog id="clear-events-dialog" class="delete-account-dialog">
+    <div class="clear-events-panel">
+      <div class="dialog-head"><div><h2>清空操作记录</h2></div><button class="icon-close" type="button" data-close-clear aria-label="关闭">×</button></div>
+      <p class="delete-account-copy">仅清空插件页面中的操作记录，不会更改账号优先级、调度状态或恢复记录。</p>
+      <div class="dialog-actions"><button class="button" type="button" data-close-clear>取消</button><button class="button danger-action" id="clear-events-confirm" type="button">清空记录</button></div>
+    </div>
+  </dialog>
+</body>
+</html>
