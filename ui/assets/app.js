@@ -10,7 +10,9 @@
     { id: 'temporary', name: '临时', priority: 99, color: '#a64c2c', soft: '#f8ece6', callable: false },
   ];
   const callGroups = groups.filter((group) => group.callable !== false);
-  const qualityWindowSize = 15;
+  const qualityWindowSize = 20;
+  const qualityAverageSize = 16;
+  const qualityAverageHint = '完整窗口内，缓存比例与首字时间各自去掉最高 2 个和最低 2 个值，取中间 16 个值的均值。';
   const confirmWindows = (count) => Math.max(2, Number(count) || 2);
   const groupPriorityDefaults = Object.fromEntries(groups.map(({ id, priority }) => [id, priority]));
   const knownPlatforms = ['openai', 'anthropic', 'gemini', 'vertex', 'antigravity', 'grok', 'deepseek', 'qwen', 'moonshot', 'zhipu', 'minimax', 'siliconflow', 'ollama', 'openrouter', 'openai_compatible'];
@@ -56,7 +58,9 @@
   let sequence = 0;
   let pollTimer = null;
   let eventLog = [];
+  let renderedEventRows = [];
   const hiddenEventKeys = new Set();
+  const expandedMonitorAccounts = new Set();
   let eventPage = 1;
   const eventPageSize = 10;
   const pending = new Map();
@@ -130,9 +134,9 @@
         <div class="setting-row setting-row-input"><div><strong>恢复确认时长</strong><span>达到健康窗口数和最短试运行时长后才确认恢复。</span></div><div class="unit-input"><input data-field="recovery-seconds" type="number" min="60" max="86400" step="1" aria-label="${group.name}组恢复确认时长"><span>秒</span></div></div>`}
         <div class="setting-row setting-row-input"><div><strong>失败重试基准</strong><span>默认 300 秒；连续失败后间隔每次加倍，最长 24 小时。</span></div><div class="unit-input"><input data-field="retry-seconds" type="number" min="30" max="86400" step="1" aria-label="${group.name}组失败重试基准（秒）"><span>秒</span></div></div>
         ${group.special ? '<div class="condition-row"><label class="check-line"><input data-field="elite-enabled" type="checkbox" aria-label="优秀组启用独占策略"><span>倍率低于下限时独占调用</span></label><div class="unit-input"><input data-field="elite-minimum" type="number" min="0.01" max="1000000" step="0.01" aria-label="优秀组独占倍率下限"><span>×</span></div></div>' +
-          '<div class="setting-row setting-row-input"><div><strong>独占缓存下限</strong><span>缓存低于此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-cache-minimum" type="number" min="0.1" max="100" step="0.1" aria-label="优秀组独占缓存下限"><span>%</span></div></div>' +
-          '<div class="setting-row setting-row-input"><div><strong>独占平均首字时间上限</strong><span>最近 15 个有效样本均值超过此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-ttft-maximum" type="number" min="1" max="3600000" step="1" aria-label="优秀组独占首字时间上限"><span>ms</span></div></div>' +
-          '<p class="rule-footnote">独占仅保留倍率最低的合格账号。缓存或首字时间触发任一独占条件就退出独占，按本组普通规则继续调用；样本不足时不判失败。</p>' : ''}
+          '<div class="setting-row setting-row-input"><div><strong>独占缓存下限</strong><span>缓存去极值均值低于此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-cache-minimum" type="number" min="0.1" max="100" step="0.1" aria-label="优秀组独占缓存下限"><span>%</span></div></div>' +
+          '<div class="setting-row setting-row-input"><div><strong>独占平均首字时间上限</strong><span>首字去极值均值超过此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-ttft-maximum" type="number" min="1" max="3600000" step="1" aria-label="优秀组独占首字时间上限"><span>ms</span></div></div>' +
+          '<p class="rule-footnote">独占仅保留倍率最低的合格账号。按最近 20 次有效调用计算去极值后的均值，触发任一条件即按本组普通规则继续调用。样本不足时不判失败。</p>' : ''}
         ${group.alwaysOn ? '<p class="rule-footnote">常开组和当前普通调用组可同时开启，不因质量指标停用。立即尝试清除宿主限流、过载或临时不可调度标记；持续或反复失败则退避。宿主账号错误需人工处理，不会自动清除。</p>' : ''}`;
       const ruleDefaults = defaultRule(group.id);
       const fieldDefaults = { priority: group.priority, 'retry-seconds': ruleDefaults.cooldown_seconds, 'min-input-tokens': ruleDefaults.min_input_tokens,
@@ -321,6 +325,10 @@
     const monitoredGroups = groups
       .map((group, index) => ({ group, rank: index, members: groupAccounts(group.id) }))
       .filter(({ members }) => members.length > 0);
+    for (const id of expandedMonitorAccounts) {
+      const account = monitoredGroups.flatMap(({ members }) => members).find((item) => item.id === id);
+      if (!collecting || !account || monitorWindowHistory(account).length < 2) expandedMonitorAccounts.delete(id);
+    }
     renderAccountOverview(monitoredGroups.flatMap(({ members }) => members));
     renderRouteOrder(monitoredGroups.filter(({ group }) => group.callable !== false));
     $('monitor-empty').hidden = monitoredGroups.length > 0;
@@ -357,7 +365,7 @@
 
   function renderMonitorRow(account, collecting, unavailable = false) {
     const history = collecting ? monitorWindowHistory(account) : [];
-    const currentWindows = collecting ? monitorCurrentWindows(account) : [];
+    const currentWindow = collecting ? monitorCurrentWindows(account)[0] : undefined;
     const row = document.createElement('tr');
     const identityCell = document.createElement('td');
     const identity = document.createElement('span');
@@ -375,22 +383,9 @@
     const scheduleCell = document.createElement('td');
     scheduleCell.append(makeScheduleStatus(account));
 
-    const [cacheCell, sampleCell, ttftCell] = makeMonitorWindowCells(account, collecting, history[0] || currentWindows[0], 1);
-    if ((history.length && currentWindows.length) || currentWindows.length > 1) {
-      const current = document.createElement('details');
-      current.className = 'monitor-current-sampling';
-      const summary = document.createElement('summary');
-      summary.textContent = '当前进度';
-      current.append(summary);
-      currentWindows.forEach((window) => {
-        const progress = document.createElement('small');
-        progress.textContent = window.window_known === false ? '进度未知' : `有效 ${count(window.requests)}/${qualityWindowSize}`;
-        current.append(progress);
-        if (window.window_known !== false) current.append(makeSamplingExclusions(window));
-      });
-      sampleCell.append(current);
-    }
-
+    const currentProgressCell = makeMonitorCurrentCell(account, collecting, currentWindow);
+    const currentCacheCell = makeMonitorCurrentCacheCell(account, collecting, currentWindow);
+    const currentTTFTCell = makeMonitorCurrentTTFTCell(account, collecting, currentWindow);
     const statusCell = document.createElement('td');
     const runtimeState = runtimeGroupState(account);
     if (unavailable) {
@@ -417,22 +412,31 @@
     }
     status.addEventListener('click', () => showRuntimeDetails(account));
     statusCell.append(status);
-    row.append(identityCell, rateCell, scheduleCell, cacheCell, sampleCell, ttftCell, statusCell);
+    row.append(identityCell, rateCell, scheduleCell, currentProgressCell, currentCacheCell, currentTTFTCell, statusCell);
     const countdown = status.querySelector('.monitor-retry-countdown');
     if (countdown) updateMonitorRetry(countdown);
-    if (history.length < 2) return row;
-    for (const cell of [identityCell, rateCell, scheduleCell, statusCell]) cell.rowSpan = history.length;
     const rows = document.createDocumentFragment();
     rows.append(row);
-    history.slice(1).forEach((window, index) => {
-      const older = document.createElement('tr');
-      older.className = row.className;
-      older.classList.remove('monitor-window-row');
-      older.classList.add('monitor-history-row');
-      older.dataset.historyAccountId = account.id;
-      older.append(...makeMonitorWindowCells(account, collecting, window, index + 2));
-      rows.append(older);
+    if (!history.length) return rows;
+    const historyRows = history.map((window, index) => makeMonitorHistoryRow(account, collecting, window, index + 1));
+    const toggle = historyRows[0].querySelector('.monitor-history-toggle');
+    const hiddenRows = historyRows.slice(1);
+    if (!hiddenRows.length && toggle) toggle.remove();
+    const updateHistory = (expanded) => {
+      for (const older of hiddenRows) older.hidden = !expanded;
+      if (toggle) {
+        toggle.setAttribute('aria-expanded', String(expanded));
+        toggle.textContent = `${expanded ? '收起' : '展开'}周期 ${hiddenRows.map((_, index) => index + 2).join('、')}`;
+      }
+    };
+    updateHistory(expandedMonitorAccounts.has(account.id));
+    if (toggle) toggle.addEventListener('click', () => {
+      const expanded = !expandedMonitorAccounts.has(account.id);
+      if (expanded) expandedMonitorAccounts.add(account.id);
+      else expandedMonitorAccounts.delete(account.id);
+      updateHistory(expanded);
     });
+    rows.append(...historyRows);
     return rows;
   }
 
@@ -441,7 +445,7 @@
 
   function monitorWindowHistory(account) {
     const history = account.diagnostics?.sampling?.history;
-    return (Array.isArray(history) ? history : []).filter((window) => window && window.requests === qualityWindowSize)
+    return (Array.isArray(history) ? history : []).filter((window) => Number.isInteger(window?.requests) && window.requests > 0)
       .sort((a, b) => (Date.parse(b.window_end) - Date.parse(a.window_end) || Date.parse(b.recorded_at) - Date.parse(a.recorded_at) || 0))
       .slice(0, 3);
   }
@@ -461,19 +465,98 @@
     return excluded;
   }
 
-  function makeMonitorWindowCells(account, collecting, window, position) {
-    const rule = currentRule(account.group, account.platform);
-    const unknownWindow = window?.isCurrent && window.window_known === false;
-    const sampleCount = window ? window.requests : Number(account.calls) || 0;
-    const ratio = unknownWindow ? null : window ? Number.isFinite(window.cache_ratio) ? window.cache_ratio * 100 : null : account.cache;
-    const cacheCell = document.createElement('td');
-    cacheCell.className = 'monitor-window-cache';
+  function windowSampleLabel(window) {
+    if (window.isCurrent) return `有效 ${count(window.requests)}/${qualityWindowSize}`;
+    if (window.requests !== qualityWindowSize) return `采样 ${window.requests}`;
+    const hasCache = Number.isFinite(window.cache_ratio);
+    const hasTTFT = Number.isFinite(window.average_first_token_ms) && window.first_token_samples >= qualityWindowSize;
+    const mean = hasCache && hasTTFT ? '均值' : hasCache ? '缓存均值' : hasTTFT ? '首字均值' : '';
+    return `采样 ${window.requests}${mean ? ` · ${mean} ${qualityAverageSize}` : ''}`;
+  }
+
+  function makeMonitorCurrentCell(account, collecting, window) {
+    const cell = document.createElement('td');
+    cell.className = 'monitor-sample monitor-current-progress';
+    if (!collecting) {
+      cell.textContent = '—';
+      return cell;
+    }
+    const unknown = window?.window_known === false;
+    const progress = document.createElement('span');
+    progress.textContent = unknown ? '进度未知' : window ? `有效 ${count(window.requests)}/${qualityWindowSize}` : '等待采样';
+    cell.append(progress);
+    if (window && !unknown) cell.append(makeSamplingExclusions(window));
+    return cell;
+  }
+
+  function makeMonitorCurrentCacheCell(account, collecting, window) {
+    const cell = document.createElement('td');
+    cell.className = 'monitor-window-cache';
     const cache = document.createElement('div');
     cache.className = 'monitor-cache';
+    const unknown = window?.window_known === false;
+    const ratio = unknown ? null : Number.isFinite(window?.cache_ratio) ? window.cache_ratio * 100 : account.cache;
+    const sampleCount = window ? Number(window.requests) || 0 : Number(account.calls) || 0;
+    const value = document.createElement('strong');
+    value.textContent = !collecting ? '未采集' : Number.isFinite(ratio) && sampleCount > 0 ? `${ratio.toFixed(1)}%` : '—';
+    cache.append(value);
+    if (collecting && Number.isFinite(ratio) && sampleCount > 0) {
+      const rule = currentRule(account.group, account.platform);
+      const meter = document.createElement('span');
+      meter.className = `meter${account.group !== 'always_on' && ratio < rule.min_cache_ratio * 100 ? ' low' : ''}`;
+      const fill = document.createElement('span');
+      fill.style.width = `${Math.max(0, Math.min(100, ratio))}%`;
+      meter.append(fill);
+      cache.append(meter);
+    } else cache.classList.add('unknown');
+    cell.append(cache);
+    return cell;
+  }
+
+  function makeMonitorCurrentTTFTCell(account, collecting, window) {
+    const cell = document.createElement('td');
+    cell.className = 'monitor-sample monitor-window-ttft';
+    if (!collecting) {
+      cell.textContent = '未采集';
+      return cell;
+    }
+    const unknown = window?.window_known === false;
+    const value = Number.isFinite(window?.average_first_token_ms) ? window.average_first_token_ms : account.averageFirstTokenMs;
+    const samples = Number.isFinite(window?.first_token_samples) ? window.first_token_samples : account.firstTokenSamples;
+    if (!unknown && Number.isFinite(value) && samples > 0) cell.textContent = `${Math.round(value)}ms`;
+    else if (!unknown && samples > 0) cell.textContent = `样本不足 ${count(samples)}/${qualityWindowSize}`;
+    else cell.textContent = '—';
+    return cell;
+  }
+
+  function makeMonitorHistoryRow(account, collecting, window, position) {
+    const row = document.createElement('tr');
+    row.className = 'monitor-history-row';
+    row.dataset.historyAccountId = account.id;
+    row.dataset.period = String(position);
+    const cells = makeMonitorPeriodCacheCell(account, collecting, window, position);
+    cells.push(makeMonitorWindowSampleCell(account, collecting, window));
+    cells.push(makeMonitorWindowTTFTCell(account, collecting, window));
+    cells.push(document.createElement('td'));
+    row.append(document.createElement('td'), document.createElement('td'), document.createElement('td'), ...cells);
+    return row;
+  }
+
+  function makeMonitorPeriodCacheCell(account, collecting, window, position) {
+    const rule = currentRule(account.group, account.platform);
+    const cacheCell = document.createElement('td');
+    cacheCell.className = 'monitor-window-cache monitor-period-cache';
+    const cache = document.createElement('div');
+    cache.className = 'monitor-cache';
+    const label = document.createElement('strong');
+    label.className = 'monitor-window-label';
+    label.textContent = `周期 ${position}`;
+    cache.append(label);
     const cacheValue = document.createElement('strong');
-    cacheValue.textContent = !collecting ? '未采集' : Number.isFinite(ratio) && sampleCount > 0 && (window || account.complete) ? `${ratio.toFixed(1)}%` : '—';
+    const ratio = Number.isFinite(window?.cache_ratio) ? window.cache_ratio * 100 : null;
+    cacheValue.textContent = collecting && Number.isFinite(ratio) ? `${ratio.toFixed(1)}%` : '—';
     cache.append(cacheValue);
-    if (collecting && Number.isFinite(ratio) && sampleCount > 0 && (window || account.complete)) {
+    if (collecting && Number.isFinite(ratio)) {
       const meter = document.createElement('span');
       meter.className = `meter${account.group !== 'always_on' && ratio < rule.min_cache_ratio * 100 ? ' low' : ''}`;
       const fill = document.createElement('span');
@@ -482,40 +565,48 @@
       cache.append(meter);
     } else cache.classList.add('unknown');
     cacheCell.append(cache);
+    const toggle = document.createElement('button');
+    toggle.type = 'button';
+    toggle.className = 'monitor-history-toggle';
+    toggle.textContent = '展开周期 2、3';
+    toggle.setAttribute('aria-expanded', 'false');
+    if (position === 1) cache.append(toggle);
+    return [cacheCell];
+  }
+
+  function makeMonitorWindowSampleCell(account, collecting, window) {
     const sampleCell = document.createElement('td');
     sampleCell.className = 'monitor-sample monitor-window-sample';
-    if (window) {
-      const label = document.createElement('strong');
-      label.className = `monitor-window-label ${['healthy', 'abnormal'].includes(window.result) ? window.result : 'unknown'}`;
-      label.textContent = `${window.isCurrent ? '当前周期' : `周期 ${position}`}${window.isCurrent ? '' : ` · ${({ healthy: '健康', abnormal: '异常' })[window.result] || '未知'}`}`;
-      sampleCell.append(label);
-      if (!window.isCurrent) {
-        const time = document.createElement('small');
-        const start = new Date(window.window_start);
-        const end = new Date(window.window_end);
-        const dateOptions = { month: '2-digit', day: '2-digit' };
-        const timeOptions = { hour: '2-digit', minute: '2-digit', hour12: false };
-        const startDate = start.toLocaleDateString('zh-CN', dateOptions);
-        const endDate = end.toLocaleDateString('zh-CN', dateOptions);
-        time.textContent = `${startDate} ${start.toLocaleTimeString('zh-CN', timeOptions)}–${startDate === endDate ? '' : `${endDate} `}${end.toLocaleTimeString('zh-CN', timeOptions)}`;
-        sampleCell.append(time);
-      }
-    }
+    const sampleCount = Number(window?.requests) || 0;
     const valid = document.createElement('span');
-    valid.textContent = !collecting ? '—' : unknownWindow ? '进度未知' : window ? `有效 ${sampleCount}/${qualityWindowSize} · ≥${tokenMinimum(window.min_input_tokens)}` : '等待采样';
-    valid.title = '有效请求须达到输入上下文门槛；每 15 个有效请求组成一个周期。';
+    valid.textContent = !collecting ? '—' : `有效 ${count(sampleCount)}/${qualityWindowSize} · ≥${tokenMinimum(window?.min_input_tokens)}`;
+    valid.title = qualityAverageHint;
     sampleCell.append(valid);
-    if (collecting && window && !unknownWindow) {
-      sampleCell.append(makeSamplingExclusions(window));
-    }
-    const ttft = window ? window.average_first_token_ms : account.averageFirstTokenMs;
-    const ttftSamples = window ? window.first_token_samples : account.firstTokenSamples;
+    if (collecting) sampleCell.append(makeSamplingExclusions(window));
+    return sampleCell;
+  }
+
+  function makeMonitorWindowTTFTCell(account, collecting, window) {
     const ttftCell = document.createElement('td');
     ttftCell.className = 'monitor-sample monitor-window-ttft';
-    const limit = !window && account.firstTokenLimitReached ? ' · 已达扫描上限' : '';
-    ttftCell.textContent = !collecting || unknownWindow ? '—' : Number.isFinite(ttft) && ttftSamples >= qualityWindowSize
-      ? `${Math.round(ttft)}ms${limit}` : `样本不足 ${ttftSamples || 0}/${qualityWindowSize}${limit}`;
-    return [cacheCell, sampleCell, ttftCell];
+    const time = document.createElement('small');
+    time.className = 'monitor-window-time';
+    const start = new Date(window.window_start);
+    const end = new Date(window.window_end);
+    const dateOptions = { month: '2-digit', day: '2-digit' };
+    const timeOptions = { hour: '2-digit', minute: '2-digit', hour12: false };
+    const startDate = start.toLocaleDateString('zh-CN', dateOptions);
+    const endDate = end.toLocaleDateString('zh-CN', dateOptions);
+    time.textContent = `${startDate} ${start.toLocaleTimeString('zh-CN', timeOptions)}–${startDate === endDate ? '' : `${endDate} `}${end.toLocaleTimeString('zh-CN', timeOptions)}`;
+    ttftCell.append(time);
+    const ttft = window.average_first_token_ms;
+    const ttftSamples = window.first_token_samples;
+    if (collecting && Number.isFinite(ttft) && ttftSamples >= qualityWindowSize) {
+      const value = document.createElement('span');
+      value.textContent = `${Math.round(ttft)}ms`;
+      ttftCell.append(value);
+    }
+    return ttftCell;
   }
 
   function makeScheduleStatus(account) {
@@ -528,7 +619,7 @@
     return badge;
   }
 
-  function makeEventAction(event) {
+  function makeEventAction(action, fallback) {
     const labels = { pause: '暂停调度', paused: '异常停用', priority: '同步优先级', ready: '开放调用', temporary: '临时组暂停',
       group_wait: '等待前序组', exclusive_wait: '独占等待', unavailable: '宿主不可用', needs_rate: '等待倍率', pending: '异常确认中',
       deprioritize: '降低优先级', restored: '恢复调用', manual_change: '检测人工变更', skipped: '跳过动作',
@@ -537,10 +628,10 @@
       manually_disabled: '手动停用', observing: '采样观察', unknown: '状态未知' };
     const badge = document.createElement('span');
     badge.className = 'event-action';
-    if (['restored', 'recovered', 'account_repaired'].includes(event.action)) badge.classList.add('restore');
-    else if (['manual_change', 'account_error'].includes(event.action)) badge.classList.add('danger');
-    else if (event.action === 'skipped') badge.classList.add('warning');
-    badge.textContent = labels[event.action] || safeText(event.action, '记录');
+    if (['restored', 'recovered', 'account_repaired'].includes(action)) badge.classList.add('restore');
+    else if (['manual_change', 'account_error'].includes(action)) badge.classList.add('danger');
+    else if (action === 'skipped') badge.classList.add('warning');
+    badge.textContent = labels[action] || fallback || safeText(action, '记录');
     return badge;
   }
 
@@ -554,28 +645,33 @@
     if (!body || !empty || !pagination || !pageLabel || !previous || !next) return;
     const totalPages = Math.max(1, Math.ceil(eventLog.length / eventPageSize));
     eventPage = Math.min(Math.max(1, eventPage), totalPages);
-    const pageItems = eventLog.slice((eventPage - 1) * eventPageSize, eventPage * eventPageSize);
-    const rows = pageItems.map((event) => {
-      const row = document.createElement('tr');
-      const time = document.createElement('td');
-      time.className = 'event-time';
-      time.textContent = event.time ? new Date(event.time).toLocaleString('zh-CN', { hour12: false }) : '—';
-      const account = document.createElement('td');
-      account.className = 'event-account';
+    const pageItems = eventLog.slice((eventPage - 1) * eventPageSize, eventPage * eventPageSize).map((event) => {
       const accountID = Number(event.account_id);
-      const match = accounts.find((item) => Number(item.id) === accountID);
-      const accountName = typeof event.account_name === 'string' && event.account_name.trim() ? event.account_name.trim() : match?.name || '账号';
-      account.textContent = accountID > 0 ? `${accountName} · ID ${accountID}` : '系统';
-      const action = document.createElement('td');
-      action.append(makeEventAction(event));
-      const message = document.createElement('td');
-      message.className = 'event-message';
-      message.textContent = safeText(event.message, '—');
-      row.append(time, account, action, message);
-      return row;
+      const accountName = typeof event.account_name === 'string' && event.account_name.trim()
+        ? event.account_name.trim() : accounts.find((item) => Number(item.id) === accountID)?.name || '账号';
+      return { time: event.time, account: accountID > 0 ? `${accountName} · ID ${accountID}` : '系统',
+        action: event.action, safeAction: safeText(event.action, '记录'), message: safeText(event.message, '—') };
     });
-    body.replaceChildren(...rows);
-    empty.hidden = rows.length > 0;
+    if (!sameData(renderedEventRows, pageItems)) {
+      body.replaceChildren(...pageItems.map((event) => {
+        const row = document.createElement('tr');
+        const time = document.createElement('td');
+        time.className = 'event-time';
+        time.textContent = event.time ? new Date(event.time).toLocaleString('zh-CN', { hour12: false }) : '—';
+        const account = document.createElement('td');
+        account.className = 'event-account';
+        account.textContent = event.account;
+        const action = document.createElement('td');
+        action.append(makeEventAction(event.action, event.safeAction));
+        const message = document.createElement('td');
+        message.className = 'event-message';
+        message.textContent = event.message;
+        row.append(time, account, action, message);
+        return row;
+      }));
+      renderedEventRows = pageItems;
+    }
+    empty.hidden = pageItems.length > 0;
     pagination.hidden = eventLog.length === 0;
     pageLabel.textContent = `第 ${eventPage} / ${totalPages} 页`;
     previous.disabled = eventPage <= 1;
@@ -584,10 +680,11 @@
 
   function renderEvents(events) {
     const incoming = Array.isArray(events) ? events : [];
-    eventLog = incoming.filter((event) => !hiddenEventKeys.has(eventKey(event))).slice().reverse();
+    const visible = incoming.filter((event) => !hiddenEventKeys.has(eventKey(event))).reverse();
+    const changed = !sameData(eventLog, visible);
+    if (changed) eventLog = visible;
     renderEventPage();
-    const clear = $('event-clear');
-    if (clear) clear.disabled = !configLoaded || busy || eventLog.length === 0;
+    return changed;
   }
 
   function eventKey(event) {
@@ -601,7 +698,7 @@
       const heading = document.createElement('div');
       const time = document.createElement('time');
       time.textContent = runtimeTime(Date.parse(event.time));
-      heading.append(makeEventAction(event), time);
+      heading.append(makeEventAction(event.action), time);
       const message = document.createElement('p');
       message.textContent = safeText(event.message, '—');
       item.append(heading, message);
@@ -712,11 +809,12 @@
     $('runtime-detail-priority').textContent = `当前 ${!resetSessionPending && account.resolved && Number.isFinite(account.priority) ? account.priority : '待同步'} · 配置 ${configuredPriority}`;
     const collecting = automationEnabled && samplingActive;
     const rule = currentRule(account.group, account.platform);
-    $('runtime-detail-cache').textContent = !collecting ? '未采集' : Number.isFinite(account.cache)
-      ? `${account.cache.toFixed(1)}% · ${account.calls || 0} 次` : `— · ${account.calls || 0} 次`;
+    const cache = Number.isFinite(account.cache) ? `${account.cache.toFixed(1)}%` : '—';
+    const cacheMean = Number.isFinite(account.cache) && account.complete && account.calls === qualityWindowSize ? `原始窗口值 · 判断均值${qualityAverageSize}` : '';
+    $('runtime-detail-cache').textContent = !collecting ? '未采集' : `${cache} · ${account.calls || 0} 次${cacheMean}`;
     const ttftLimit = account.firstTokenLimitReached ? ' · 已达 5000 条扫描上限' : '';
     $('runtime-detail-ttft').textContent = !collecting ? '未采集' : Number.isFinite(account.averageFirstTokenMs) && account.firstTokenSamples >= qualityWindowSize
-      ? `${Math.round(account.averageFirstTokenMs)} ms · ${qualityWindowSize} 个有效样本${ttftLimit}` : `样本不足 · ${account.firstTokenSamples || 0} / ${qualityWindowSize}${ttftLimit}`;
+      ? `${Math.round(account.averageFirstTokenMs)} ms · 原始窗口值 · 判断均值${qualityAverageSize}${ttftLimit}` : `样本不足 · ${account.firstTokenSamples || 0} / ${qualityWindowSize}${ttftLimit}`;
     setText('runtime-detail-filter', collecting ? `≥${tokenMinimum(account.minimumInputTokens ?? rule.min_input_tokens)} Token` : '未采集');
     const reason = collecting ? account.reason || account.availability : '';
     $('runtime-detail-reason').textContent = reason || '当前状态没有异常说明。';
@@ -782,28 +880,43 @@
     entry.append(heading);
     if (!window.isCurrent) {
       const time = document.createElement('p');
-      time.textContent = `${runtimeTime(Date.parse(window.window_start))} → ${runtimeTime(Date.parse(window.window_end))}`;
+      time.className = 'runtime-window-line runtime-window-time';
+      time.textContent = runtimeTime(Date.parse(window.window_start));
       entry.append(time);
     }
-    const progress = document.createElement('p');
-    progress.textContent = `${unknown ? '进度与剔除数未知' : `有效 ${count(window.requests)}/${qualityWindowSize}`} · ≥${tokenMinimum(window.min_input_tokens)}`;
-    entry.append(progress);
+    const details = document.createElement('p');
+    details.className = 'runtime-window-line runtime-window-progress';
+    if (unknown) {
+      details.textContent = '进度与剔除数未知';
+    } else {
+      const sample = document.createElement('span');
+      sample.textContent = `${windowSampleLabel(window)} · ≥${tokenMinimum(window.min_input_tokens)}`;
+      const excluded = makeSamplingExclusions(window);
+      excluded.className += ' runtime-window-exclusions';
+      details.append(sample, ' · ', excluded);
+    }
+    if (!window.isCurrent && window.requests === qualityWindowSize) details.title = qualityAverageHint;
+    entry.append(details);
     if (unknown) {
       const note = document.createElement('p');
+      note.className = 'runtime-window-line';
       note.textContent = '未完整扫描至封窗边界';
       entry.append(note);
     } else {
       const metrics = document.createElement('p');
+      metrics.className = 'runtime-window-line runtime-window-metrics';
       const ratio = Number.isFinite(window.cache_ratio) ? `${(window.cache_ratio * 100).toFixed(1)}%` : '—';
-      const ttft = Number.isFinite(window.average_first_token_ms) && window.first_token_samples >= qualityWindowSize
-        ? `${Math.round(window.average_first_token_ms)} ms` : `样本不足 ${count(window.first_token_samples)}/${qualityWindowSize}`;
+      const required = window.isCurrent ? qualityWindowSize : window.requests;
+      const ttft = Number.isFinite(window.average_first_token_ms) && window.first_token_samples >= required
+        ? `${Math.round(window.average_first_token_ms)} ms` : `样本不足 ${count(window.first_token_samples)}/${required}`;
       metrics.textContent = `缓存 ${ratio} · 首字 ${ttft}`;
-      entry.append(metrics, makeSamplingExclusions(window));
+      entry.append(metrics);
       const models = makeWindowModels(window);
       if (models) entry.append(models);
     }
     if (window.reason) {
       const reason = document.createElement('p');
+      reason.className = 'runtime-window-line';
       reason.textContent = safeText(window.reason, '');
       entry.append(reason);
     }
@@ -816,7 +929,7 @@
     const usage = document.createElement('div');
     usage.className = 'runtime-window-models';
     const heading = document.createElement('p');
-    heading.textContent = '模型调用';
+    heading.textContent = '模型调用 · 全量统计';
     usage.append(heading);
     for (const model of models) {
       const row = document.createElement('div');
@@ -1146,6 +1259,13 @@
 
   function copy(value) { return JSON.parse(JSON.stringify(value)); }
   function isObject(value) { return value !== null && typeof value === 'object' && !Array.isArray(value); }
+  function sameData(a, b) {
+    if (Object.is(a, b)) return true;
+    if (!a || !b || typeof a !== 'object' || typeof b !== 'object' || Array.isArray(a) !== Array.isArray(b)) return false;
+    const keys = Object.keys(a);
+    return keys.length === Object.keys(b).length &&
+      keys.every((key) => Object.prototype.hasOwnProperty.call(b, key) && sameData(a[key], b[key]));
+  }
   function safeText(value, fallback = '未知') {
     if (typeof value !== 'string' || !value.trim()) return fallback;
     let result = value;
@@ -1328,12 +1448,10 @@
       if (!disposed) { renderGroups(); refreshStatus(); }
     }
   }
-  function normalizeAccount(raw) {
+  function normalizeAccount(raw, previous, setting) {
     const id = String(raw.id);
-    const previous = accounts.find((account) => account.id === id);
     const upstream = Number.isFinite(raw.upstream_rate) ? raw.upstream_rate : null;
     const local = Number.isFinite(raw.account_rate) ? raw.account_rate : null;
-    const setting = savedConfig?.account_settings?.find((item) => String(item.account_id) === id);
     const hasSetting = Boolean(setting);
     const mode = hasSetting ? setting.rate_mode === 'fixed' ? 'fixed' : 'upstream' : previous?.rateMode === 'fixed' ? 'fixed' : 'upstream';
     const fixedRate = hasSetting ? Number.isFinite(setting.fixed_rate) ? setting.fixed_rate : 1 : previous?.fixedRate ?? 1;
@@ -1377,6 +1495,8 @@
     try { snapshot = JSON.parse(result.status_json || '{}'); } catch (_) { throw new Error('运行快照无法解析。'); }
     runtimeHostname = typeof snapshot.hostname === 'string' ? snapshot.hostname : runtimeHostname;
     runtimeReady = typeof snapshot.version === 'string' && snapshot.version !== '';
+    const wasResetPending = resetSessionPending;
+    const wasSampling = samplingActive;
     const session = typeof snapshot.sampling_since === 'string' ? snapshot.sampling_since : '';
     const sessionChanged = session && session !== samplingSession;
     if (resetSessionPending && session && session !== samplingSession) resetSessionPending = false;
@@ -1385,14 +1505,23 @@
     runtimePolling = !resetSessionPending && snapshot.polling === true;
     const next = Date.parse(snapshot.next_poll);
     nextPollAt = !resetSessionPending && Number.isFinite(next) ? next : null;
-    const currentByID = new Map(accounts.map((account) => [account.id, sessionChanged || !samplingActive ? clearAccountSession(account) : account]));
-    const runtimeAccounts = Array.isArray(snapshot.accounts) ? snapshot.accounts.map(normalizeAccount) : [];
-    const runtimeByID = new Map(runtimeAccounts.map((account) => [account.id, account]));
+    const currentByID = new Map(accounts.map((account) => [account.id, account]));
+    const settingByID = new Map((savedConfig?.account_settings || [])
+      .filter((setting) => setting?.account_id != null).map((setting) => [String(setting.account_id), setting]));
+    const runtimeByID = new Map((Array.isArray(snapshot.accounts) ? snapshot.accounts : []).map((raw) => [String(raw.id), raw]));
     const configuredIDs = Array.isArray(savedConfig?.account_ids) ? savedConfig.account_ids.map(String) : [];
-    accounts = configuredIDs.map((id) => runtimeByID.get(id) || currentByID.get(id) || {
-      id, name: `账号 ${id}`, platform: 'unknown', group: 'temporary', status: 'ready', fixedRate: null, accountRate: null,
-      upstreamRate: null, cache: null, calls: 0, letter: id.slice(-2), rateMode: 'fixed', fixedRate: 1,
+    const nextAccounts = configuredIDs.map((id) => {
+      const previous = currentByID.get(id);
+      const raw = runtimeByID.get(id);
+      const account = raw ? normalizeAccount(raw, previous, settingByID.get(id))
+        : previous ? (sessionChanged || !samplingActive ? clearAccountSession(previous) : previous)
+        : { id, name: `账号 ${id}`, platform: 'unknown', group: 'temporary', status: 'ready', fixedRate: 1, accountRate: null,
+          upstreamRate: null, cache: null, calls: 0, letter: id.slice(-2), rateMode: 'fixed' };
+      // Row handlers keep the account reference while the account data stays the same.
+      return sameData(previous, account) ? previous : account;
     });
+    const accountsChanged = nextAccounts.length !== accounts.length || nextAccounts.some((account, index) => account !== accounts[index]);
+    if (accountsChanged) accounts = nextAccounts;
     setText('runtime-mode', ({ unconfigured: '未配置', monitoring: '仅监控', automatic: '自动管理', standby: '待机', error: '运行异常' })[snapshot.mode] || '未知');
     setText('runtime-storage', snapshot.storage_ready ? '可用' : '未就绪');
     const version = runtimeReady ? safeText(snapshot.version).replace(/^v/, '') : '';
@@ -1402,10 +1531,14 @@
     setText('runtime-next-poll', snapshot.next_poll ? new Date(snapshot.next_poll).toLocaleString('zh-CN', { hour12: false }) : '未知');
     setText('runtime-automation-state', automationEnabled ? '已启用' : '未启用');
     if (snapshot.error) showMessage(safeText(snapshot.error), 'error');
-    renderEvents(snapshot.events);
-    const oldPlatform = activePlatform;
-    renderGroups();
-    if (oldPlatform !== activePlatform) renderRuleEditor();
+    const eventsChanged = renderEvents(snapshot.events);
+    if (accountsChanged || sessionChanged || wasResetPending !== resetSessionPending || wasSampling !== samplingActive) {
+      const oldPlatform = activePlatform;
+      renderGroups();
+      if (oldPlatform !== activePlatform) renderRuleEditor();
+    } else if (eventsChanged && $('runtime-detail-dialog').open) {
+      renderAccountEvents({ id: detailAccountId });
+    }
     updateAddAccountControls();
   }
   async function refreshStatus() {
@@ -1453,7 +1586,7 @@
       if (revision === samplingRevision) {
         if (response.result.status_json) renderStatus(response.result);
         showMessage('已请求立即采集，结果将在本轮完成后更新。', 'success');
-        await refreshStatus();
+        if (!response.result.status_json) await refreshStatus();
       }
     } catch (error) { if (!disposed) showMessage(error.message || '手动请求失败。', 'error'); }
     finally { manualRequestBusy = false; updatePollControls(); }

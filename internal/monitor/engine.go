@@ -611,7 +611,7 @@ func (e *Engine) Cycle(parent context.Context, now time.Time) {
 		}
 		if executor && ledgerOK {
 			item.history = readQualityHistory(ctx, store, c, row, ledger.SamplingSince)
-			if record != nil && !policyChanged && item.history != nil {
+			if record != nil && record.QualityScope == accountQualityScope && !policyChanged && item.history != nil {
 				item.priorQualityWindows, item.priorQualityPending = retryPriorQualityHistory(ctx, api, row, record, rule, item.history)
 			}
 		}
@@ -621,7 +621,7 @@ func (e *Engine) Cycle(parent context.Context, now time.Time) {
 		if row.AccountRate == nil && w.AccountRate != nil {
 			row.AccountRate = w.AccountRate
 		}
-		row.Complete, row.CacheRatio = w.Complete, w.Ratio()
+		row.Complete, row.CacheRatio = w.Complete, w.CacheRatio
 		row.MinInputTokens, row.ExcludedSmallRequests, row.ExcludedUnknownRequests =
 			w.MinInputTokens, w.ExcludedSmallRequests, w.ExcludedUnknownRequests
 		row.AverageFirstTokenMs, row.FirstTokenSamples = w.AverageFirstTokenMs, w.FirstTokenSamples

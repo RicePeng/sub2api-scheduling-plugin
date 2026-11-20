@@ -61,6 +61,7 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			continue
 		}
 		if r != nil {
+			migrateQualityWindow(r)
 			if r.Action != "schedule" {
 				item.restoring = true
 				if r.Phase == "pending_restore" && matchesOriginal(a, r) {
@@ -110,10 +111,10 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 		if r == nil {
 			r = &ActionRecord{AccountID: a.ID, AdminURL: c.AdminURL, Executor: c.ExecutorHostname, Action: "schedule", Phase: "active",
 				OriginalPriority: a.Priority, TargetPriority: a.Priority, OriginalSchedulable: a.Schedulable, TargetSchedulable: a.Schedulable,
-				OriginalStatus: a.Status, Platform: a.Platform, Group: item.setting.Group, Policy: rule, AppliedAt: now, StatusSince: now}
+				OriginalStatus: a.Status, Platform: a.Platform, Group: item.setting.Group, Policy: rule, AppliedAt: now, StatusSince: now,
+				QualityScope: accountQualityScope}
 			ledger.Records[key], item.record = r, r
 		}
-		migrateQualityWindow(r)
 		if retry := r.QualityHistoryRetry; retry != nil && item.history != nil &&
 			!sampleAfter(retry.Through, item.history.LastSample) && item.history.LastSample != "" {
 			r.QualityHistoryRetry = nil
@@ -574,11 +575,11 @@ func (e *Engine) clearTemporary(ctx context.Context, api API, store Store, ledge
 func exclusiveExitReason(rule config.Rule, row AccountStatus) string {
 	if rule.ExclusiveMinCacheRatio > 0 && row.Complete && row.Requests >= config.QualityWindowRequests &&
 		row.CacheRatio != nil && *row.CacheRatio < rule.ExclusiveMinCacheRatio {
-		return fmt.Sprintf("缓存命中比例 %.1f%% 低于独占下限 %.1f%%，退出独占并按本组规则调用", *row.CacheRatio*100, rule.ExclusiveMinCacheRatio*100)
+		return fmt.Sprintf("缓存命中比例去极值均值 %.1f%% 低于独占下限 %.1f%%，退出独占并按本组规则调用", *row.CacheRatio*100, rule.ExclusiveMinCacheRatio*100)
 	}
 	if rule.ExclusiveMaxAverageFirstTokenMs > 0 && row.AverageFirstTokenMs != nil && row.FirstTokenSamples >= config.QualityWindowRequests &&
 		*row.AverageFirstTokenMs > rule.ExclusiveMaxAverageFirstTokenMs {
-		return fmt.Sprintf("最近 %d 次平均首字时间 %.0f ms 超过独占上限 %.0f ms，退出独占并按本组规则调用", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.ExclusiveMaxAverageFirstTokenMs)
+		return fmt.Sprintf("最近 %d 次首字时间去极值均值 %.0f ms 超过独占上限 %.0f ms，退出独占并按本组规则调用", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.ExclusiveMaxAverageFirstTokenMs)
 	}
 	return ""
 }
@@ -750,14 +751,14 @@ func evaluate(rule config.Rule, row AccountStatus) (bad, known bool, reason, sam
 		if !row.Complete || row.CacheRatio == nil || row.Requests < config.QualityWindowRequests {
 			known = false
 		} else if *row.CacheRatio < rule.MinCacheRatio {
-			return true, true, fmt.Sprintf("缓存命中比例 %.1f%% 低于本组下限 %.1f%%", *row.CacheRatio*100, rule.MinCacheRatio*100), "cache:" + row.SampleKey
+			return true, true, fmt.Sprintf("缓存命中比例去极值均值 %.1f%% 低于本组下限 %.1f%%", *row.CacheRatio*100, rule.MinCacheRatio*100), "cache:" + row.SampleKey
 		}
 	}
 	if rule.MaxAverageFirstTokenMs > 0 {
 		if row.AverageFirstTokenMs == nil || row.FirstTokenSamples < config.QualityWindowRequests {
 			known = false
 		} else if *row.AverageFirstTokenMs > rule.MaxAverageFirstTokenMs {
-			return true, true, fmt.Sprintf("最近 %d 次平均首字时间 %.0f ms 超过本组上限 %.0f ms", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.MaxAverageFirstTokenMs), "ttft:" + row.FirstTokenSampleKey
+			return true, true, fmt.Sprintf("最近 %d 次首字时间去极值均值 %.0f ms 超过本组上限 %.0f ms", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.MaxAverageFirstTokenMs), "ttft:" + row.FirstTokenSampleKey
 		}
 	}
 	if !known {

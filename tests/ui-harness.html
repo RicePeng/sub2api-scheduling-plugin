@@ -5,7 +5,7 @@
 'use strict';
 // Test fixtures only. This harness is not included in the production ui/ assets.
 window.mock = {
-  requests: [], holdTypes: [], rejectTypes: [], config: { upstream_rates_enabled: false,
+  requests: [], holdTypes: [], rejectTypes: [], omitTestSnapshot: false, config: { upstream_rates_enabled: false,
     group_rules: { excellent: { min_requests: 1, trigger_samples: 1, recovery_samples: 1 } } },
   snapshot: { version: '0.1.1-test', hostname: 'test-executor-01', mode: 'unconfigured', storage_ready: true,
     sampling_since: '2026-11-18T00:00:00Z', polling: false,
@@ -16,8 +16,8 @@ window.qualityWindow = (window_end, values = {}) => ({
   window_start: new Date(Date.parse(window_end) - 90000).toISOString(),
   window_end,
   recorded_at: new Date(Date.parse(window_end) + 5000).toISOString(),
-  requests: 15, min_input_tokens: 40000, excluded_small_requests: 0, excluded_unknown_requests: 0,
-  cache_ratio: .91, average_first_token_ms: 960, first_token_samples: 15, result: 'healthy', reason: '',
+  requests: 20, min_input_tokens: 40000, excluded_small_requests: 0, excluded_unknown_requests: 0,
+  cache_ratio: .91, average_first_token_ms: 960, first_token_samples: 20, result: 'healthy', reason: '',
   ...values,
 });
 const frame = document.getElementById('plugin');
@@ -36,7 +36,8 @@ window.addEventListener('message', (event) => {
       window.mock.snapshot.polling = true;
       window.mock.snapshot.next_poll = null;
     }
-    window.respond(message, { result: { success: true, message: 'ui-secret-canary', status_json: JSON.stringify(window.mock.snapshot) } });
+    window.respond(message, { result: { success: true, message: 'ui-secret-canary',
+      ...(window.mock.omitTestSnapshot ? {} : { status_json: JSON.stringify(window.mock.snapshot) }) } });
   }
   if (message.type === 'plugin.status') window.respond(message, { result: { healthy: true, message: 'ui-secret-canary', status_json: JSON.stringify(window.mock.snapshot) } });
 });

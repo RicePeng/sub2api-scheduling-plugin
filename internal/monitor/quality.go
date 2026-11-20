@@ -13,7 +13,7 @@ import (
 	"sub2api.local/cache-manager/internal/config"
 )
 
-const accountQualityScope = "account-v1"
+const accountQualityScope = "account-trimmed-v2"
 const qualityHistoryLimit = 3
 
 type legacyQualityTrack struct {
@@ -43,8 +43,12 @@ func legacyQualityAnchor(r *ActionRecord) string {
 		return r.QualityLegacyAnchor
 	}
 	// A single cutoff after all consumed legacy windows avoids reusing calls
-	// or trying to combine pieces of incompatible per-model boundaries.
-	last := latestSample("", r.LastQualityWindow)
+	// from either per-model windows or the previous account window.
+	last := latestSample("", r.QualityLegacyAnchor)
+	last = latestSample(last, r.LastQualityWindow)
+	if r.QualityHistoryRetry != nil {
+		last = latestSample(last, r.QualityHistoryRetry.Through)
+	}
 	for _, track := range r.QualityTracks {
 		last = latestSample(last, track.LastSample)
 		last = latestSample(last, track.LegacyAnchor)
@@ -67,6 +71,7 @@ func migrateQualityWindow(r *ActionRecord) {
 	}
 	r.QualityLegacyAnchor = legacyQualityAnchor(r)
 	r.QualityScope, r.QualityTracks = accountQualityScope, nil
+	r.QualityHistoryRetry = nil
 	// Legacy releases omitted some default fields from stored rules.
 	r.Policy = config.NormalizeRule(r.Policy)
 	if r.FailureKind == "" && r.HoldUntil != nil &&
@@ -152,9 +157,11 @@ func readQualityHistory(ctx context.Context, store Store, c config.Config, row *
 		saved = accountQualityHistory{AdminURL: c.AdminURL, Executor: c.ExecutorHostname, SamplingSince: session}
 	}
 	if saved.Scope != accountQualityScope {
-		saved.Scope, saved.LastSample, saved.History = accountQualityScope, "", nil
+		saved.Scope, saved.History = accountQualityScope, nil
+		saved.LastSample = latestSample("", saved.LastSample)
 		for _, track := range saved.LegacyBuckets {
 			saved.LastSample = latestSample(saved.LastSample, track.LastSample)
+			saved.LastSample = latestSample(saved.LastSample, track.LegacyAnchor)
 		}
 	}
 	saved.LegacyBuckets = nil
@@ -164,7 +171,7 @@ func readQualityHistory(ctx context.Context, store Store, c config.Config, row *
 func qualityMeasurement(rule config.Rule, window adminapi.QualityWindow) (bad, known bool, reason string) {
 	rule.MaxRateMultiplier = 0 // Price policy is evaluated separately by the scheduler.
 	bad, known, reason, _ = evaluate(rule, AccountStatus{Complete: true,
-		Requests: window.Requests, CacheRatio: window.Ratio(),
+		Requests: window.Requests, CacheRatio: window.CacheRatio,
 		AverageFirstTokenMs: window.AverageFirstTokenMs, FirstTokenSamples: window.FirstTokenSamples})
 	return bad, known, reason
 }
@@ -177,7 +184,7 @@ func freshQualityWindow(window adminapi.QualityWindow, after string) bool {
 
 func writeQualityHistory(ctx context.Context, store Store, item *managedAccount, rule config.Rule, now time.Time) {
 	saved := item.history
-	if saved == nil || item.setting.Group == "temporary" {
+	if saved == nil {
 		return
 	}
 	// Preserve the older cursor until its missing history is recovered or is
@@ -207,7 +214,7 @@ func writeQualityHistory(ctx context.Context, store Store, item *managedAccount,
 		entry := QualityWindowHistory{WindowStart: start.UTC(), WindowEnd: end.UTC(), RecordedAt: now.UTC(),
 			Requests: window.Requests, MinInputTokens: window.MinInputTokens,
 			ExcludedSmallRequests: window.ExcludedSmallRequests, ExcludedUnknownRequests: window.ExcludedUnknownRequests,
-			CacheRatio: window.Ratio(), AverageFirstTokenMs: window.AverageFirstTokenMs, FirstTokenSamples: window.FirstTokenSamples,
+			CacheRatio: window.CacheRatio, AverageFirstTokenMs: window.AverageFirstTokenMs, FirstTokenSamples: window.FirstTokenSamples,
 			Models: modelDetails(window.Models), Result: result, Reason: reason}
 		next.History = append([]QualityWindowHistory{entry}, next.History[:min(qualityHistoryLimit-1, len(next.History))]...)
 		next.LastSample = window.LastSample
@@ -277,7 +284,7 @@ func fillQualityStatus(row *AccountStatus, r *ActionRecord, saved *accountQualit
 	}
 	if w := row.quality; w != nil {
 		status.Requests, status.FirstTokenSamples, status.CacheRatio, status.AverageFirstTokenMs =
-			w.Requests, w.FirstTokenSamples, w.Ratio(), w.AverageFirstTokenMs
+			w.Requests, w.FirstTokenSamples, w.CacheRatio, w.AverageFirstTokenMs
 		status.MinInputTokens, status.ExcludedSmallRequests, status.ExcludedUnknownRequests =
 			w.MinInputTokens, w.ExcludedSmallRequests, w.ExcludedUnknownRequests
 		status.WindowKnown, status.Models = w.WindowKnown, modelDetails(w.Models)

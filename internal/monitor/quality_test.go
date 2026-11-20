@@ -18,10 +18,9 @@ import (
 
 func qualityWindow(at time.Time, oldestID int, model, requestType string, ratio float64) adminapi.QualityWindow {
 	key := at.UTC().Format(time.RFC3339Nano) + ":"
-	read := int64(ratio*1000 + .5)
 	return adminapi.QualityWindow{
 		Requests: config.QualityWindowRequests, WindowKnown: true,
-		InputTokens: 1000 - read, CacheReadTokens: read,
+		CacheRatio: &ratio,
 		LastSample: key + strconv.Itoa(oldestID+config.QualityWindowRequests-1), FirstSample: key + strconv.Itoa(oldestID),
 		Models: []adminapi.QualityModelUsage{{Model: model, RequestType: requestType, Requests: config.QualityWindowRequests, CacheRatio: &ratio}},
 	}
@@ -75,10 +74,10 @@ func TestQualityWindowsPreserveWarmupAndAccountWideConfirmation(t *testing.T) {
 	if s := snapshotAccount(t, e, 7).QualitySampling; s == nil || len(s.History) != 1 || s.BadWindows != 0 {
 		t.Fatalf("history retry after restart counted warmup traffic as a fault: %+v", s)
 	}
-	api.usage[7] = adminapi.Window{QualityCurrent: &adminapi.QualityWindow{Requests: 14, WindowKnown: true}}
+	api.usage[7] = adminapi.Window{QualityCurrent: &adminapi.QualityWindow{Requests: 19, WindowKnown: true}}
 	e.Cycle(context.Background(), at(180))
-	if s := snapshotAccount(t, e, 7).QualitySampling; s == nil || s.Requests != 14 || s.BadWindows != 0 {
-		t.Fatalf("14 calls contributed to confirmation instead of trailing: %+v", s)
+	if s := snapshotAccount(t, e, 7).QualitySampling; s == nil || s.Requests != 19 || s.BadWindows != 0 {
+		t.Fatalf("19 calls contributed to confirmation instead of trailing: %+v", s)
 	}
 	qualityCycle(e, api, at(180), 7, bad(180, 400, "a", "sync"))
 	qualityCycle(e, api, at(359), 7, bad(180, 414, "b", "stream"))
@@ -98,6 +97,24 @@ func TestQualityWindowsPreserveWarmupAndAccountWideConfirmation(t *testing.T) {
 	if api.accounts[7].Schedulable || record.FailureKind != "quality" || record.FailureCount != 1 ||
 		record.HoldUntil == nil || !record.HoldUntil.Equal(at(660)) {
 		t.Fatalf("confirmed account windows did not pause at the default cooldown: %+v", record)
+	}
+}
+
+func TestQualityHistoryIsPersistedForTemporaryAccounts(t *testing.T) {
+	e, c, api, store, now := setup(t, account(7, "openai", "apikey", 5, true))
+	c.AccountSettings[0].Group = "temporary"
+	configureQuality(&c, "temporary", .8, 0)
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	e.Cycle(context.Background(), now)
+	qualityCycle(e, api, now.Add(time.Minute), 7, qualityWindow(now.Add(time.Minute), 100, "m", "sync", .9))
+	row := snapshotAccount(t, e, 7)
+	if row.QualitySampling == nil || len(row.QualitySampling.History) != 1 {
+		t.Fatalf("temporary account completed window was not published: %+v", row.QualitySampling)
+	}
+	if raw, err := store.Get(context.Background(), historyKey(7)); err != nil || len(raw) == 0 {
+		t.Fatalf("temporary account completed window was not persisted: err=%v raw=%q", err, raw)
 	}
 }
 
@@ -253,8 +270,8 @@ func TestAccountScopeUpgradeKeepsRecoveryButNotOldProgress(t *testing.T) {
 		t.Fatal(err)
 	}
 	restarted := restartMonitor(t, e, c, store, hold.Add(300*time.Second))
-	// The newest 15 calls would be a suffix of the already consumed old window.
-	overlap := qualityWindow(at, 145, "m", "sync", .95)
+	// The synthetic window is made exclusively from already consumed calls.
+	overlap := qualityWindow(at, 140, "m", "sync", .95)
 	qualityCycle(restarted, api, hold.Add(300*time.Second), 7, overlap)
 	r = ledgerOf(t, store).Records["7"]
 	if r.QualityScope != accountQualityScope || !r.RecoveryTrial || r.RecoveryStartedAt == nil ||
@@ -263,7 +280,7 @@ func TestAccountScopeUpgradeKeepsRecoveryButNotOldProgress(t *testing.T) {
 	}
 	for i, seconds := range []int{360, 420} {
 		at = hold.Add(time.Duration(seconds) * time.Second)
-		qualityCycle(restarted, api, at, 7, qualityWindow(at, 160+15*i, "m", "sync", .95))
+		qualityCycle(restarted, api, at, 7, qualityWindow(at, 160+20*i, "m", "sync", .95))
 		if r = ledgerOf(t, store).Records["7"]; r.RecoveryTrial != (i == 0) {
 			t.Fatalf("trial recovery did not require two fresh windows after upgrade: %+v", r)
 		}
@@ -307,6 +324,45 @@ func TestLegacyPolicyFieldsDoNotReleaseActiveHoldOnUpgrade(t *testing.T) {
 	}
 }
 
+func TestQualityUpgradePreservesManualProtection(t *testing.T) {
+	for _, phase := range []string{"manual_change", "active"} {
+		t.Run(phase, func(t *testing.T) {
+			e, c, api, store, now := setup(t, account(7, "openai", "apikey", 8, true))
+			e.Cycle(context.Background(), now)
+			ledger := ledgerOf(t, store)
+			r := ledger.Records["7"]
+			anchor := now.Format(time.RFC3339Nano) + ":15"
+			hold := now.Add(5 * time.Minute)
+			r.Phase, r.QualityScope, r.Policy.MinRequests = phase, "account-v1", 15
+			r.BadWindows, r.QualityReason, r.QualityEvaluatedAt = 1, "旧质量异常", &now
+			r.QualityHistoryRetry = &qualityHistoryRetry{Since: now, Through: anchor}
+			r.HoldUntil, r.FailureKind, r.DegradationLevel = &hold, "quality", 2
+			if err := save(context.Background(), store, &ledger); err != nil {
+				t.Fatal(err)
+			}
+			a := api.accounts[7]
+			a.Priority, a.Schedulable = 17, false
+			api.accounts[7] = a
+			api.usage[7] = adminapi.Window{QualityCurrent: &adminapi.QualityWindow{WindowKnown: true}}
+			at := now.Add(time.Minute)
+			restarted := restartMonitor(t, e, c, store, at)
+			restarted.Cycle(context.Background(), at)
+			row := snapshotAccount(t, restarted, 7)
+			r = ledgerOf(t, store).Records["7"]
+			if r.Phase != "manual_change" || row.State != "manual_change" || row.Schedulable || row.Priority != 17 ||
+				r.HoldUntil == nil || !r.HoldUntil.Equal(hold) || r.FailureKind != "quality" || r.DegradationLevel != 2 ||
+				!r.OriginalSchedulable || r.OriginalPriority != 8 {
+				t.Fatalf("upgrade changed manual protection or durable restoration state: row=%+v record=%+v", row, r)
+			}
+			if r.QualityScope != accountQualityScope || r.QualityLegacyAnchor != anchor || r.QualityHistoryRetry != nil ||
+				r.BadWindows != 0 || r.QualityReason != "" || r.QualityEvaluatedAt != nil || row.QualitySampling == nil ||
+				row.QualitySampling.BadWindows != 0 || strings.Contains(row.QualitySampling.Reason, "旧质量异常") {
+				t.Fatalf("manual account still exposes incompatible quality progress: row=%+v record=%+v", row, r)
+			}
+		})
+	}
+}
+
 func TestQualityHistoryIsBoundedIndependentAndPersistent(t *testing.T) {
 	e, c, api, store, now := setup(t,
 		account(7, "openai", "apikey", 5, true), account(8, "anthropic", "apikey", 4, true))
@@ -325,17 +381,17 @@ func TestQualityHistoryIsBoundedIndependentAndPersistent(t *testing.T) {
 	}
 	for i := 0; i < 4; i++ {
 		at := now.Add(time.Duration(i+1) * time.Minute)
-		b := qualityWindow(at, 100+15*i, "m", "sync", .9)
-		b.FirstTokenSamples, b.AverageFirstTokenMs = 15, ptr(100)
+		b := qualityWindow(at, 100+20*i, "m", "sync", .9)
+		b.FirstTokenSamples, b.AverageFirstTokenMs = 20, ptr(100)
 		if i == 2 {
-			b.FirstTokenSamples, b.AverageFirstTokenMs = 14, nil
+			b.FirstTokenSamples, b.AverageFirstTokenMs = 19, nil
 		}
 		if i == 3 {
-			b.InputTokens, b.CacheReadTokens = 300, 700
+			b.CacheRatio = ptr(.7)
 			b.ExcludedSmallRequests, b.ExcludedUnknownRequests = 2, 1
 		}
-		partial := &adminapi.QualityWindow{Requests: 14, WindowKnown: true,
-			Models: []adminapi.QualityModelUsage{{Model: "m", RequestType: "stream", Requests: 14}}}
+		partial := &adminapi.QualityWindow{Requests: 19, WindowKnown: true,
+			Models: []adminapi.QualityModelUsage{{Model: "m", RequestType: "stream", Requests: 19}}}
 		api.usage[7] = adminapi.Window{QualityCurrent: partial, QualityWindows: []adminapi.QualityWindow{b}}
 		e.Cycle(context.Background(), at)
 	}
@@ -343,7 +399,7 @@ func TestQualityHistoryIsBoundedIndependentAndPersistent(t *testing.T) {
 	restarted.Cycle(context.Background(), now.Add(5*time.Minute))
 	row := snapshotAccount(t, restarted, 7)
 	if row.MinInputTokens != 49000 || row.State != "ready" || !row.Schedulable || row.QualitySampling == nil ||
-		row.QualitySampling.Requests != 14 || len(row.QualitySampling.Models) != 1 {
+		row.QualitySampling.Requests != 19 || len(row.QualitySampling.Models) != 1 {
 		t.Fatalf("always-on or current partial window wrong after restart: %+v", row)
 	}
 	sampling := row.QualitySampling
@@ -351,7 +407,7 @@ func TestQualityHistoryIsBoundedIndependentAndPersistent(t *testing.T) {
 	if sampling.BadWindows != 0 || sampling.ExcludedSmallRequests != 0 || sampling.ExcludedUnknownRequests != 0 || len(h) != 3 ||
 		h[0].Result != "abnormal" || h[1].Result != "unknown" || h[2].Result != "healthy" ||
 		h[0].MinInputTokens != 49000 || h[0].ExcludedSmallRequests != 2 || h[0].ExcludedUnknownRequests != 1 ||
-		h[0].Requests != 15 || !h[0].WindowEnd.Equal(now.Add(4*time.Minute)) ||
+		h[0].Requests != 20 || !h[0].WindowEnd.Equal(now.Add(4*time.Minute)) ||
 		!h[2].WindowEnd.Equal(now.Add(2*time.Minute)) {
 		t.Fatalf("history is not durable, bounded, and truthfully ordered: %+v", sampling)
 	}
@@ -451,6 +507,16 @@ func setupHTTPQuality(t *testing.T, ratio, ttft float64) (*Engine, config.Config
 				input, read, ttft = 10000, 90000, 120
 			case "small":
 				input, ttft = 4999, 9000
+			case "boundary-low":
+				input, read = 20000, 20000
+			case "boundary-mid":
+				input, read = 12000, 28000
+			case "boundary-high":
+				input, read = 4000, 36000
+			case "boundary-top":
+				input, read = 0, 40000
+			case "boundary-top-slow":
+				input, read, ttft = 0, 40000, 20000
 			}
 			row := adminapi.Usage{ID: int64(len(rows) + 1), AccountID: 7, CreatedAt: at,
 				Model: model, RequestType: requestType, InputTokens: &input, CacheCreationTokens: &creation, CacheReadTokens: &read, FirstTokenMs: &ttft}
@@ -467,6 +533,98 @@ func setupHTTPQuality(t *testing.T, ratio, ttft float64) (*Engine, config.Config
 		mu.Lock()
 		defer mu.Unlock()
 		failNextUsage = true
+	}
+}
+
+func TestHTTPQualityAtExactCacheBoundaryKeepsExcellentExclusivity(t *testing.T) {
+	e, c, _, now, add, _ := setupHTTPQuality(t, .8, 1000)
+	c.AccountSettings[0].Group, c.AccountSettings[0].FixedRate = "excellent", ptr(.01)
+	c.GroupPriorities["excellent"] = c.GroupPriorities["general"]
+	configureQuality(&c, "excellent", .8, 1000)
+	rule := c.GroupRules["excellent"]
+	rule.ExclusiveMaxAverageFirstTokenMs = 1000
+	c.GroupRules["excellent"] = rule
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	e.Cycle(context.Background(), now)
+	for i := 1; i <= 2; i++ {
+		at := now.Add(time.Duration(i) * 180 * time.Second)
+		add(2, at, "boundary-low", "a", "sync")
+		add(10, at, "boundary-mid", "a", "sync")
+		add(2, at, "boundary-high", "b", "stream")
+		add(4, at, "boundary-top", "b", "stream")
+		add(2, at, "boundary-top-slow", "b", "stream")
+		e.Cycle(context.Background(), at)
+		row := snapshotAccount(t, e, 7)
+		if !row.Schedulable || row.State != "ready" || strings.Contains(row.Reason, "退出独占") || row.CacheRatio == nil || *row.CacheRatio != .8 ||
+			row.AverageFirstTokenMs == nil || *row.AverageFirstTokenMs != 100 || row.QualitySampling == nil ||
+			row.QualitySampling.GoodWindows != i || row.QualitySampling.BadWindows != 0 ||
+			len(row.QualitySampling.History) != i || row.QualitySampling.History[0].Result != "healthy" {
+			t.Fatalf("an exact cache boundary or discarded TTFT spike changed scheduling: row=%+v sampling=%+v", row, row.QualitySampling)
+		}
+	}
+}
+
+func TestHTTPQualityUpgradesAccountV1DuringRecovery(t *testing.T) {
+	e, c, store, now, add, _ := setupHTTPQuality(t, .8, 1000)
+	oldFirst, oldPrior := now.Add(time.Second), now.Add(2*time.Second)
+	trial := now.Add(3 * time.Minute)
+	lastOld := trial.Add(time.Minute)
+	key := func(at time.Time, id int) string { return at.Format(time.RFC3339Nano) + ":" + strconv.Itoa(id) }
+	add(15, oldFirst, "bad", "old", "sync")
+	add(15, oldPrior, "bad", "old", "sync")
+	add(15, lastOld, "healthy", "old-trial", "sync")
+	ctx := context.Background()
+	history, err := json.Marshal(accountQualityHistory{AdminURL: c.AdminURL, Executor: c.ExecutorHostname,
+		SamplingSince: now, Scope: "account-v1", LastSample: key(oldFirst, 15),
+		History: []QualityWindowHistory{{Requests: 15, Result: "abnormal"}}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Set(ctx, historyKey(7), history); err != nil {
+		t.Fatal(err)
+	}
+	row := AccountStatus{ID: 7}
+	if h := readQualityHistory(ctx, store, c, &row, now); h == nil || h.LastSample != key(oldFirst, 15) || len(h.History) != 0 {
+		t.Fatalf("upgrade did not preserve the history boundary without old results: %+v", h)
+	}
+	ledger := ledgerOf(t, store)
+	r := ledger.Records["7"]
+	deadline := trial.Add(15 * time.Minute)
+	r.QualityScope, r.Policy.MinRequests, r.GoodWindows = "account-v1", 15, 1
+	r.LastQualityWindow, r.QualityReason = key(lastOld, 45), "旧窗口健康"
+	r.QualityHistoryRetry = &qualityHistoryRetry{Since: now, Through: key(oldPrior, 30)}
+	r.SampleSince, r.RecoveryStartedAt, r.RecoveryDeadline = &trial, &trial, &deadline
+	r.RecoveryTrial, r.FailureKind, r.FailureCount, r.DegradationLevel = true, "quality", 2, 2
+	if err := save(ctx, store, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	at := trial.Add(5 * time.Minute)
+	add(19, at, "healthy", "fresh", "sync")
+	e = restartMonitor(t, e, c, store, at)
+	e.Cycle(ctx, at)
+	row, r = snapshotAccount(t, e, 7), ledgerOf(t, store).Records["7"]
+	b := row.QualitySampling
+	if row.Error != "" || row.State != "recovering" || b == nil || b.Requests != 19 || len(b.History) != 0 || b.GoodWindows != 0 ||
+		r.QualityScope != accountQualityScope || r.QualityLegacyAnchor != key(lastOld, 45) || r.QualityHistoryRetry != nil ||
+		!r.RecoveryTrial || r.RecoveryStartedAt == nil || !r.RecoveryStartedAt.Equal(trial) ||
+		r.RecoveryDeadline == nil || !r.RecoveryDeadline.Equal(deadline) || r.FailureCount != 2 || r.DegradationLevel != 2 {
+		t.Fatalf("upgrade reused old rows or lost trial state: row=%+v sampling=%+v record=%+v", row, b, r)
+	}
+	add(1, at.Add(time.Second), "healthy", "fresh", "sync")
+	e.Cycle(ctx, at.Add(time.Second))
+	row = snapshotAccount(t, e, 7)
+	b = row.QualitySampling
+	if row.State != "recovering" || b.GoodWindows != 1 || b.Requests != 0 || len(b.History) != 1 ||
+		b.History[0].Requests != 20 || !b.History[0].WindowStart.Equal(at) {
+		t.Fatalf("the first fresh window did not seal or inherited old recovery progress: row=%+v sampling=%+v", row, b)
+	}
+	add(20, at.Add(2*time.Second), "healthy", "fresh", "stream")
+	e.Cycle(ctx, at.Add(2*time.Second))
+	row = snapshotAccount(t, e, 7)
+	if row.State != "ready" || row.RecoveryTrial || row.QualityGoodWindows != 2 {
+		t.Fatalf("two fresh windows did not complete recovery: %+v", row)
 	}
 }
 
@@ -496,27 +654,27 @@ func TestHTTPQualitySealsConsecutiveWindowsAndShowsTrailingCalls(t *testing.T) {
 	if b == nil || b.Requests != 10 || len(b.History) != 0 || len(b.Models) != 1 || b.Models[0].Requests != 10 {
 		t.Fatalf("legacy history leaked or 10 requests did not remain in the account window: %+v", b)
 	}
-	add(5, at.Add(time.Second), "high-cache", "b", "stream")
+	add(10, at.Add(time.Second), "high-cache", "b", "stream")
 	at = at.Add(time.Second)
 	e.Cycle(context.Background(), at)
 	row := snapshotAccount(t, e, 7)
 	b = row.QualitySampling
 	if b == nil || b.Requests != 0 || len(b.History) != 1 {
-		t.Fatalf("10+5 requests did not make a single account window: %+v", b)
+		t.Fatalf("10+10 requests did not make a single account window: %+v", b)
 	}
 	h := b.History[0]
-	if h.Requests != 15 || h.FirstTokenSamples != 15 || len(h.Models) != 2 ||
+	if h.Requests != 20 || h.FirstTokenSamples != 20 || len(h.Models) != 2 ||
 		h.Models[0].Model != "a" || h.Models[0].RequestType != "sync" || h.Models[0].Requests != 10 ||
-		h.Models[1].Model != "b" || h.Models[1].RequestType != "stream" || h.Models[1].Requests != 5 ||
-		h.CacheRatio == nil || *h.CacheRatio != 650000.0/900000 ||
-		h.AverageFirstTokenMs == nil || *h.AverageFirstTokenMs != 240 ||
+		h.Models[1].Model != "b" || h.Models[1].RequestType != "stream" || h.Models[1].Requests != 10 ||
+		h.CacheRatio == nil || *h.CacheRatio != .7 ||
+		h.AverageFirstTokenMs == nil || *h.AverageFirstTokenMs != 210 ||
 		h.Result != "abnormal" || h.ExcludedSmallRequests != 1 || b.BadWindows != 1 {
-		t.Fatalf("incorrect weighted window and model details: %+v", h)
+		t.Fatalf("incorrect trimmed window and model details: %+v", h)
 	}
 
 	add(1, at.Add(time.Second), "unknown", "a", "sync")
-	add(15, at.Add(2*time.Second), "healthy", "a", "sync")
-	add(15, at.Add(3*time.Second), "bad", "b", "stream")
+	add(20, at.Add(2*time.Second), "healthy", "a", "sync")
+	add(20, at.Add(3*time.Second), "bad", "b", "stream")
 	add(1, at.Add(4*time.Second), "small", "a", "sync")
 	add(1, at.Add(4*time.Second), "unknown", "b", "stream")
 	partialAt := at.Add(5 * time.Second)
@@ -585,7 +743,7 @@ func TestHTTPQualitySealsConsecutiveWindowsAndShowsTrailingCalls(t *testing.T) {
 		!b.History[0].RecordedAt.Equal(sealedAt) {
 		t.Fatalf("unchanged poll re-used a sealed or partial window: %+v", b)
 	}
-	add(11, at.Add(time.Second), "bad", "c", "ws_v2")
+	add(16, at.Add(time.Second), "bad", "c", "ws_v2")
 	e.Cycle(context.Background(), at.Add(time.Second))
 	row = snapshotAccount(t, e, 7)
 	b = row.QualitySampling
@@ -593,21 +751,21 @@ func TestHTTPQualitySealsConsecutiveWindowsAndShowsTrailingCalls(t *testing.T) {
 		b.History[0].ExcludedSmallRequests != 1 || b.History[0].ExcludedUnknownRequests != 1 ||
 		!b.History[0].WindowStart.Equal(partialAt) ||
 		!b.History[0].WindowEnd.Equal(at.Add(time.Second)) || ledgerOf(t, store).Records["7"].FailureCount != 1 {
-		t.Fatalf("11 new eligible calls did not close the partial into the next window and confirm a fault: row=%+v", row)
+		t.Fatalf("16 new eligible calls did not close the partial into the next window and confirm a fault: row=%+v", row)
 	}
 }
 
 func TestHTTPQualityKeepsDecisionBoundaryWhenHistoryFallsBeyondScanCap(t *testing.T) {
 	e, c, store, now, add, _ := setupHTTPQuality(t, .8, 0)
 	at := now.Add(180 * time.Second)
-	add(15, at, "healthy", "a", "sync")
+	add(20, at, "healthy", "a", "sync")
 	e.Cycle(context.Background(), at)
 	store.historyWriteError = true
 	at = at.Add(time.Minute)
 	add(4800, at, "healthy", "a", "sync")
 	e.Cycle(context.Background(), at)
 	b := snapshotAccount(t, e, 7).QualitySampling
-	if b == nil || b.GoodWindows != 321 || len(b.History) != 1 {
+	if b == nil || b.GoodWindows != 241 || len(b.History) != 1 {
 		t.Fatalf("decision progress was not retained across diagnostic write failure: %+v", b)
 	}
 	at = at.Add(time.Minute)
@@ -618,14 +776,14 @@ func TestHTTPQualityKeepsDecisionBoundaryWhenHistoryFallsBeyondScanCap(t *testin
 	row := snapshotAccount(t, e, 7)
 	b = row.QualitySampling
 	if !row.QualityScanLimitReached || b == nil || !b.WindowKnown ||
-		b.GoodWindows != 321 || b.Requests != 0 || b.ExcludedSmallRequests != 301 || len(b.History) != 3 ||
+		b.GoodWindows != 241 || b.Requests != 0 || b.ExcludedSmallRequests != 301 || len(b.History) != 3 ||
 		!b.History[0].WindowEnd.Equal(at.Add(-time.Minute)) || b.History[0].Models[0].Model != "a" {
 		t.Fatalf("capped scan did not align and restore the three visible predecessors: row=%+v sampling=%+v", row, b)
 	}
-	add(16, at, "healthy", "b", "stream")
+	add(21, at, "healthy", "b", "stream")
 	e.Cycle(context.Background(), at)
 	b = snapshotAccount(t, e, 7).QualitySampling
-	if !b.WindowKnown || b.GoodWindows != 322 || b.Requests != 1 || len(b.History) != 3 ||
+	if !b.WindowKnown || b.GoodWindows != 242 || b.Requests != 1 || len(b.History) != 3 ||
 		b.History[0].ExcludedSmallRequests != 301 || b.History[0].Models[0].Model != "b" ||
 		b.History[1].Models[0].Model != "a" {
 		t.Fatalf("repeated poll re-used quality windows restored after the cap: %+v", b)
@@ -635,10 +793,10 @@ func TestHTTPQualityKeepsDecisionBoundaryWhenHistoryFallsBeyondScanCap(t *testin
 func TestHTTPQualityRetriesDiagnosticHistoryAcrossTrialBoundary(t *testing.T) {
 	e, c, store, now, add, _ := setupHTTPQuality(t, .8, 1000)
 	firstBad := now.Add(180 * time.Second)
-	add(15, firstBad, "bad", "a", "sync")
+	add(20, firstBad, "bad", "a", "sync")
 	e.Cycle(context.Background(), firstBad)
 	faultAt := firstBad.Add(180 * time.Second)
-	add(15, faultAt, "bad", "b", "stream")
+	add(20, faultAt, "bad", "b", "stream")
 	store.historyWriteError = true
 	e.Cycle(context.Background(), faultAt)
 	record := ledgerOf(t, store).Records["7"]
@@ -647,7 +805,7 @@ func TestHTTPQualityRetriesDiagnosticHistoryAcrossTrialBoundary(t *testing.T) {
 	}
 	trial := *record.HoldUntil
 	// A trailing pre-trial partial cannot be combined with trial traffic.
-	add(14, trial.Add(-time.Second), "healthy", "pretrial", "sync")
+	add(19, trial.Add(-time.Second), "healthy", "pretrial", "sync")
 	e = restartMonitor(t, e, c, store, trial)
 	e.Cycle(context.Background(), trial)
 	record = ledgerOf(t, store).Records["7"]
@@ -666,18 +824,18 @@ func TestHTTPQualityRetriesDiagnosticHistoryAcrossTrialBoundary(t *testing.T) {
 		b.History[0].Result != "abnormal" {
 		t.Fatalf("diagnostic retry lost old history or mixed partial calls across the trial boundary: row=%+v sampling=%+v", row, b)
 	}
-	add(13, next.Add(time.Second), "healthy", "trial", "stream")
+	add(18, next.Add(time.Second), "healthy", "trial", "stream")
 	add(1, next.Add(time.Second), "unknown-ttft", "trial", "stream")
-	add(15, next.Add(2*time.Second), "healthy", "another", "ws_v2")
+	add(20, next.Add(2*time.Second), "healthy", "another", "ws_v2")
 	e.Cycle(context.Background(), next.Add(2*time.Second))
 	b = snapshotAccount(t, e, 7).QualitySampling
 	if record = ledgerOf(t, store).Records["7"]; !record.RecoveryTrial || record.QualityHistoryRetry != nil ||
 		b.GoodWindows != 1 || len(b.History) != 3 || b.History[1].Result != "unknown" ||
-		b.History[1].FirstTokenSamples != 14 || b.History[1].AverageFirstTokenMs != nil ||
-		b.History[1].Models[0].AverageFirstTokenMs == nil || b.History[1].Models[0].FirstTokenSamples != 14 {
+		b.History[1].FirstTokenSamples != 19 || b.History[1].AverageFirstTokenMs != nil ||
+		b.History[1].Models[0].AverageFirstTokenMs == nil || b.History[1].Models[0].FirstTokenSamples != 19 {
 		t.Fatalf("unknown TTFT counted as recovery or prior retry remained active: record=%+v sampling=%+v", record, b)
 	}
-	add(15, next.Add(3*time.Second), "healthy", "replacement", "sync")
+	add(20, next.Add(3*time.Second), "healthy", "replacement", "sync")
 	e.Cycle(context.Background(), next.Add(3*time.Second))
 	row = snapshotAccount(t, e, 7)
 	if row.State != "ready" || row.RecoveryTrial || row.QualityGoodWindows != 2 || row.FailureCount != 1 {
@@ -688,10 +846,10 @@ func TestHTTPQualityRetriesDiagnosticHistoryAcrossTrialBoundary(t *testing.T) {
 func TestHTTPQualityRetriesPriorHistoryAfterTransientReadFailure(t *testing.T) {
 	e, _, store, now, add, failNextUsage := setupHTTPQuality(t, .8, 1000)
 	firstBad := now.Add(180 * time.Second)
-	add(15, firstBad, "bad", "a", "sync")
+	add(20, firstBad, "bad", "a", "sync")
 	e.Cycle(context.Background(), firstBad)
 	faultAt := firstBad.Add(180 * time.Second)
-	add(15, faultAt, "bad", "b", "stream")
+	add(20, faultAt, "bad", "b", "stream")
 	store.historyWriteError = true
 	e.Cycle(context.Background(), faultAt)
 	record := ledgerOf(t, store).Records["7"]
@@ -702,7 +860,7 @@ func TestHTTPQualityRetriesPriorHistoryAfterTransientReadFailure(t *testing.T) {
 	e.Cycle(context.Background(), trial)
 	store.historyWriteError = false
 	next := trial.Add(time.Minute)
-	add(15, next, "healthy", "trial", "stream")
+	add(20, next, "healthy", "trial", "stream")
 	failNextUsage()
 	e.Cycle(context.Background(), next)
 	row := snapshotAccount(t, e, 7)
@@ -722,7 +880,7 @@ func TestHTTPQualityRetriesPriorHistoryAfterTransientReadFailure(t *testing.T) {
 func TestHTTPQualityRecoversCappedPriorHistoryDuringTrial(t *testing.T) {
 	e, c, store, now, add, _ := setupHTTPQuality(t, .8, 0)
 	first := now.Add(180 * time.Second)
-	add(15, first, "bad", "a", "sync")
+	add(20, first, "bad", "a", "sync")
 	e.Cycle(context.Background(), first)
 	store.historyWriteError = true
 	second := first.Add(time.Minute)
@@ -730,7 +888,7 @@ func TestHTTPQualityRecoversCappedPriorHistoryDuringTrial(t *testing.T) {
 	e.Cycle(context.Background(), second)
 	fault := first.Add(180 * time.Second)
 	add(301, fault, "small", "c", "stream")
-	add(15, fault, "bad", "c", "stream")
+	add(20, fault, "bad", "c", "stream")
 	e.Cycle(context.Background(), fault)
 	record := ledgerOf(t, store).Records["7"]
 	if record.HoldUntil == nil {

@@ -10,7 +10,7 @@ func TestDecodeDefaultsAndStrictInput(t *testing.T) {
 	c, err := Decode([]byte("{}"))
 	if err != nil || c.AutomationEnabled || !c.UpstreamRatesEnabled || c.PollSeconds != 60 || c.AccountIDs == nil ||
 		c.Rule.MinCacheRatio != .8 || c.Rule.MaxAverageFirstTokenMs != 10000 ||
-		c.Rule.MinRequests != 15 || c.Rule.TriggerSamples != 2 || c.Rule.RecoverySamples != 2 ||
+		c.Rule.MinRequests != 20 || c.Rule.TriggerSamples != 2 || c.Rule.RecoverySamples != 2 ||
 		c.Rule.ConfirmationSeconds != 180 || c.Rule.RecoverySeconds != 300 ||
 		c.Rule.MaxRateMultiplier != .2 || c.GroupRules["excellent"].ExclusiveRateBelow != .05 ||
 		c.GroupRules["excellent"].ExclusiveMinCacheRatio != .8 || c.GroupRules["excellent"].ExclusiveMaxAverageFirstTokenMs != 10000 {
@@ -27,11 +27,11 @@ func TestDecodeDefaultsAndStrictInput(t *testing.T) {
 }
 
 func TestLegacyMinRequestsNormalizesToFixedQualityWindow(t *testing.T) {
-	c, err := Decode([]byte(`{"rule":{"min_requests":20},"group_rules":{"general":{"min_requests":14}},
-		"platform_group_rules":{"openai":{"general":{"min_requests":20}}}}`))
-	if err != nil || c.Rule.MinRequests != 15 || c.GroupRules["general"].MinRequests != 15 ||
-		c.GroupRule("openai", "general").MinRequests != 15 {
-		t.Fatalf("legacy sample sizes must load with a fixed 15-request window: %+v %v", c, err)
+	c, err := Decode([]byte(`{"rule":{"min_requests":15},"group_rules":{"general":{"min_requests":14}},
+		"platform_group_rules":{"openai":{"general":{"min_requests":15}}}}`))
+	if err != nil || c.Rule.MinRequests != 20 || c.GroupRules["general"].MinRequests != 20 ||
+		c.GroupRule("openai", "general").MinRequests != 20 {
+		t.Fatalf("legacy sample sizes must load with a fixed 20-request window: %+v %v", c, err)
 	}
 }
 

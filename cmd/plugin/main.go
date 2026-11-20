@@ -8,7 +8,7 @@ import (
 	_ "time/tzdata"
 )
 
-var version = "0.1.1"
+var version = "0.1.2-Beta1"
 
 func main() {
 	hostname, err := os.Hostname()

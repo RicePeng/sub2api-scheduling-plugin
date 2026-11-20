@@ -21,6 +21,12 @@
     await page.clock.runFor(10001);
     await page.waitForFunction((n) => window.mock.requests.filter((r) => r.type === 'plugin.status').length > n, count);
   };
+  const stampStatus = () => page.evaluate(() => {
+    const stamp = new Date();
+    window.mock.snapshot.last_poll = stamp.toISOString();
+    return stamp.toLocaleString('zh-CN', { hour12: false });
+  });
+  const waitForStatus = (stamp) => ui.locator('#runtime-last-poll').getByText(stamp, { exact: true }).waitFor({ state: 'attached' });
   const field = (group, name) => ui.locator(`[data-rule-group="${group}"] [data-field="${name}"]`);
   const row = (id) => ui.locator(`[data-account-id="${id}"]`);
   await ui.locator('#bridge-state').getByText('已连接宿主', { exact: true }).waitFor();
@@ -45,6 +51,11 @@
   assert(await tokenFields.count() === 5 && (await tokenFields.evaluateAll((inputs) => inputs.map((input) => input.value))).every((value) => value === '40000'), 'all five call groups default to a 40,000-input-token sampling threshold');
   assert(await field('excellent', 'trigger-samples').inputValue() === '2' && await field('excellent', 'recovery-samples').inputValue() === '2' &&
     await field('excellent', 'trigger-samples').getAttribute('min') === '2' && await field('excellent', 'sample-count').count() === 0, 'legacy one-window rules are floored to two, sample size is not editable');
+  const samplingRule = await ui.locator('#view-rules > .rules-sampling-note').first().innerText();
+  assert(samplingRule.includes('20 次有效调用') && samplingRule.includes('各自去掉最高 2 个和最低 2 个值') &&
+    samplingRule.includes('中间 16 个值的算术平均') && samplingRule.includes('首字时间样本满 20 次才参加判断') &&
+    (await ui.locator('[data-rule-group=excellent] .rule-footnote').innerText()).includes('最近 20 次有效调用'),
+    'sampling and exclusive rules explain the window size, per-metric trimming, and TTFT minimum');
   assert(await ui.locator('#view-groups input[type=number]').count() === 0, 'priorities edited only in rule cards');
   assert(await ui.locator('.group-section').count() === 6 && await ui.locator('#flow-steps .flow-step').count() === 5 &&
     (await ui.locator('#flow-steps .parallel').innerText()).replace(/\s/g, '') === '常开·并行P5', 'always-on has a parallel path; temporary excluded from routing');
@@ -80,9 +91,9 @@
   await ui.locator('#account-dialog').waitFor({ state: 'hidden' });
   await page.evaluate(() => {
     const a = { type: 'apikey', status: 'active', schedulable: true, read_ok: true, priority: 5, group: 'temporary', state: 'ready',
-      rate_mode: 'upstream', fixed_rate: null, account_rate: 1, upstream_rate: null, requests: 15,
-      cache_ratio: .78, complete: true, average_first_token_ms: 850, first_token_samples: 15 };
-    window.mock.snapshot = { ...window.mock.snapshot, version: '0.1.1-Beta1', mode: 'monitoring', accounts: [
+      rate_mode: 'upstream', fixed_rate: null, account_rate: 1, upstream_rate: null, requests: 20,
+      cache_ratio: .78, complete: true, average_first_token_ms: 850, first_token_samples: 20 };
+    window.mock.snapshot = { ...window.mock.snapshot, version: '0.1.2-Beta1', mode: 'monitoring', accounts: [
       { ...a, id: 2081, name: '主力 API Key', platform: 'openai', upstream_rate: 1.3 },
       { ...a, id: 2082, name: '备用 API Key', platform: 'openai', group: 'good', state: 'unavailable', schedulable: false,
         effective_rate: 1,
@@ -92,7 +103,7 @@
         account_name: '主力 API Key', action: 'priority', message: `操作 ${i}` })) };
   });
   await poll();
-  await ui.locator('#top-version').getByText('v0.1.1-Beta1', { exact: true }).waitFor();
+  await ui.locator('#top-version').getByText('v0.1.2-Beta1', { exact: true }).waitFor();
   await ui.locator('#platform-select').selectOption('openai');
   await row('2081').getByText('主力 API Key', { exact: true }).waitFor();
   assert(await ui.locator('.account-row').count() === 2, 'management lists every configured account regardless of host availability');
@@ -107,7 +118,7 @@
   assert(await monitor.locator('.monitor-group-card').count() === 2 && await monitor.locator('.exception-area').count() === 2, 'only populated call groups render, including an unavailable-only group');
   assert(await ui.locator('#overview-total').innerText() === '2' && await ui.locator('#monitor-empty').isHidden(), 'monitor counts the displayed groups');
   assert((await monitor.locator('[data-monitor-account-id="2082"] .rate-pair.default').innerText()).replace(/\s/g, '') === '上游不支持默认1.0×', 'missing upstream snapshot explicitly identifies the default fallback');
-  assert(!(await monitor.innerText()).match(/850ms|14 \/ 15|78%|15 \/ 15/), 'disabled monitor hides old usage');
+  assert(!(await monitor.innerText()).match(/850ms|14 \/ 20|78%|采样 20/), 'disabled monitor hides old usage');
   assert(await ui.locator('#monitor-poll-label').innerText() === '采样未启用', 'disabled monitor has an inactive sampling label');
   assert(await ui.locator('#view-groups .exception-area, #view-groups .account-overview').count() === 0, 'management contains only account configuration');
   assert(await ui.locator('#runtime-group-list, .runtime-groups').count() === 0 && !(await ui.locator('.runtime-section').innerText()).includes('调用组运行情况'), 'lower runtime section does not duplicate account groups');
@@ -190,7 +201,7 @@
     !await field('excellent', 'confirmation-seconds').evaluate((node) => node.classList.contains('rule-customized')), 'changed parameters turn green while default values retain their normal style');
   await save(() => ui.locator('#save-rules').click());
   let c = await saved();
-  assert(c.platform_group_rules.openai.excellent.min_requests === 15 && c.platform_group_rules.openai.excellent.min_cache_ratio === .55 && c.platform_group_rules.openai.excellent.cooldown_seconds === 151 &&
+  assert(c.platform_group_rules.openai.excellent.min_requests === 20 && c.platform_group_rules.openai.excellent.min_cache_ratio === .55 && c.platform_group_rules.openai.excellent.cooldown_seconds === 151 &&
     c.platform_group_rules.openai.excellent.recovery_seconds === 330 && c.platform_group_rules.openai.always_on.cooldown_seconds === 320, 'quality rules and always-on retry seconds saved exactly');
   assert(c.platform_group_rules.openai.excellent.min_input_tokens === 56000 && c.platform_group_rules.openai.always_on.min_input_tokens === 48000, 'sampling thresholds are saved as exact token counts for both group types');
   assert(c.platform_group_rules.openai.good.max_average_first_token_ms === 2500 && c.platform_group_priorities.openai.excellent === 80, 'independent group rules and priority');
@@ -226,6 +237,12 @@
   await ui.locator('#account-dialog').waitFor({ state: 'hidden' });
   assert(!(await ui.locator('#automation-toggle').isDisabled()), 'explicit fixed zero accepted');
   assert((await row('2082').locator('.row-schedule').innerText()) === '停止调用', 'account schedule switch is visible');
+  await poll();
+  const originalManagementRow = await row('2082').elementHandle();
+  const beforeToggleStamp = await stampStatus();
+  await poll();
+  await waitForStatus(beforeToggleStamp);
+  assert(await originalManagementRow.evaluate((node) => node.isConnected), 'a metadata-only poll retains the management row and its handlers');
   await save(() => row('2082').locator('.row-schedule').click());
   assert((await saved()).account_settings.find((a) => a.account_id === 2082).desired_schedulable === false, 'account schedule switch saves off');
   assert(await ui.locator('[data-group-id="reserve"] [data-account-id="2082"]').count() === 1, 'stop-call keeps the account in its group');
@@ -264,9 +281,9 @@
       cache_ratio: null, average_first_token_ms: null, first_token_samples: 0 });
   });
   await poll();
-  await monitorButton('2081').getByText('等待采样 · 可调用').waitFor();
-  const newSamplingCell = await monitorRow('2081').locator('.monitor-window-sample').innerText();
-  assert(newSamplingCell === '等待采样' && !newSamplingCell.includes('0/15'), 'no discovered bucket yet does not imply a known empty window');
+  assert(await monitorButton('2081').innerText() === '等待采样 · 可调用', 'new session exposes live sampling state');
+  const newSamplingCell = await monitorRow('2081').locator('.monitor-current-progress').innerText();
+  assert(newSamplingCell === '等待采样' && !newSamplingCell.includes('0/20'), 'no discovered bucket yet does not imply a known empty window');
   assert(await schedule('2084').innerText() === '调度中' && await monitorButton('2084').innerText() === '可调用', 'always-on and ordinary winner run together');
   assert(await schedule('2081').innerText() === '调度中' && await schedule('2081').evaluate((node) => getComputedStyle(node).color) === 'rgb(20, 119, 95)', 'current scheduling is shown in green');
   assert(!(await ui.locator('#manual-poll').isDisabled()), 'manual collection becomes available in the new session');
@@ -278,15 +295,34 @@
   const afterCountdown = await ui.locator('#monitor-countdown').innerText();
   const afterPolls = await page.evaluate(() => window.mock.requests.filter((r) => r.type === 'plugin.status').length);
   assert(afterCountdown !== beforeCountdown && afterPolls === beforeManual.polls, `countdown updates independently of status polling (${beforeCountdown} -> ${afterCountdown}, ${beforeManual.polls} -> ${afterPolls})`);
+  const manualMonitorRow = await monitorRow('2081').elementHandle();
+  const manualStamp = await stampStatus();
   await ui.locator('#manual-poll').click();
   await ui.locator('#monitor-countdown').getByText('正在请求…').waitFor();
-  assert(await ui.locator('#manual-poll').isDisabled(), 'manual request stays disabled while collection is in flight');
-  await page.waitForFunction((count) => window.mock.requests.filter((r) => r.type === 'config.test').length > count, beforeManual.tests);
+  await waitForStatus(manualStamp);
+  assert(await ui.locator('#manual-poll').isDisabled() && await manualMonitorRow.evaluate((node) => node.isConnected),
+    'manual snapshot updates polling controls without rebuilding the monitor row');
   assert(await page.evaluate((before) => window.mock.requests.filter((r) => r.type === 'config.test').length === before.tests + 1 &&
-    window.mock.requests.filter((r) => r.type === 'config.save').length === before.saves && window.mock.snapshot.sampling_since === before.session, beforeManual), 'manual request uses collection action without saving config or resetting session');
+    window.mock.requests.filter((r) => r.type === 'config.save').length === before.saves &&
+    window.mock.requests.filter((r) => r.type === 'plugin.status').length === before.polls &&
+    window.mock.snapshot.sampling_since === before.session, beforeManual), 'manual request uses its returned snapshot without an extra status read, save or session reset');
   await page.evaluate(() => Object.assign(window.mock.snapshot, { polling: false, last_poll: new Date().toISOString(), next_poll: new Date(Date.now() + 60000).toISOString() }));
   await poll();
   assert(!(await ui.locator('#manual-poll').isDisabled()) && (await ui.locator('#monitor-countdown').innerText()).startsWith('下次请求 '), 'completion restores manual request and countdown');
+  const fallbackPolls = await page.evaluate(() => {
+    window.mock.omitTestSnapshot = true;
+    return window.mock.requests.filter((r) => r.type === 'plugin.status').length;
+  });
+  const fallbackStamp = await stampStatus();
+  await ui.locator('#manual-poll').click();
+  await waitForStatus(fallbackStamp);
+  assert(await page.evaluate((before) => window.mock.requests.filter((r) => r.type === 'plugin.status').length === before + 1, fallbackPolls) &&
+    await ui.locator('#manual-poll').isDisabled(), 'manual response without a snapshot falls back to one status read and updates the busy state');
+  await page.evaluate(() => {
+    window.mock.omitTestSnapshot = false;
+    window.mock.snapshot.polling = false;
+    window.mock.snapshot.next_poll = new Date(Date.now() + 60000).toISOString();
+  });
   checks.push('manual collection, session boundary and live countdown');
   await page.evaluate(() => {
     Object.assign(window.mock.snapshot.accounts[1], { state: 'unavailable', schedulable: false,
@@ -301,16 +337,20 @@
   assert((await ui.locator('#runtime-detail-host').innerText()).includes('账号过载至') && (await ui.locator('#runtime-detail-reason').innerText()).includes('账号过载至'), 'running details show the exact host reason');
   await ui.locator('[data-close-runtime]').last().click();
   await page.evaluate(() => {
-    Object.assign(window.mock.snapshot.accounts[0], { state: 'ready', requests: 15, complete: true,
-      cache_ratio: .78, average_first_token_ms: 850, first_token_samples: 15 });
+    const at = (secs) => new Date(Date.now() + secs * 1000).toISOString();
+    Object.assign(window.mock.snapshot.accounts[0], { state: 'ready', requests: 20, complete: true,
+      cache_ratio: .78, average_first_token_ms: 850, first_token_samples: 20 });
+    window.mock.snapshot.accounts[0].quality_sampling = { ...window.mock.snapshot.accounts[0].quality_sampling, history: [
+      window.qualityWindow(at(-60), { requests: 20, cache_ratio: .78, average_first_token_ms: 850, first_token_samples: 20 }),
+    ] };
     Object.assign(window.mock.snapshot.accounts[1], { state: 'group_wait', schedulable: false,
       reason: '', availability_reason: '', first_token_limit_reached: true });
   });
   await poll();
-  await monitorButton('2081').getByText('可调用', { exact: true }).waitFor();
+  assert(await monitorButton('2081').innerText() === '可调用', 'ready account returns to the callable list');
   assert((await monitor.innerText()).includes('850ms') && await unavailable('reserve').locator('.exception-row.waiting[data-monitor-account-id="2082"]').count() === 1, 'active metrics render and group-wait accounts move to the unavailable area');
   await monitorButton('2082').click();
-  assert((await ui.locator('#runtime-detail-ttft').innerText()).includes('14 / 15 · 已达 5000 条扫描上限'), 'unavailable account retains independent sampling details');
+  assert((await ui.locator('#runtime-detail-ttft').innerText()).includes('14 / 20 · 已达 5000 条扫描上限'), 'unavailable account retains independent sampling details');
   await ui.locator('[data-close-runtime]').last().click();
   for (const state of ['exclusive_wait', 'manually_disabled', 'unknown', 'recovering']) {
     await page.evaluate((value) => Object.assign(window.mock.snapshot.accounts[1], { state: value, read_ok: value !== 'unknown',
@@ -327,7 +367,9 @@
     }
   }
   await monitorButton('2081').click();
-  assert((await ui.locator('#runtime-detail-cache').innerText()).includes('78.0%'), 'monitor opens actual sampling details');
+  assert((await ui.locator('#runtime-detail-cache').innerText()).includes('78.0% · 20 次原始窗口值 · 判断均值16') &&
+    (await ui.locator('#runtime-detail-ttft').innerText()).includes('850 ms · 原始窗口值 · 判断均值16'),
+    'monitor distinguishes raw window metrics from the trimmed decision mean');
   await ui.locator('[data-close-runtime]').last().click();
   await page.evaluate(() => {
     const since = new Date().toISOString();
@@ -336,7 +378,7 @@
     Object.assign(window.mock.snapshot.accounts[0], {
       state: 'paused', schedulable: false, reason: '缓存命中低于下限',
       error: '管理 API 连接失败或超时：ui-secret-canary <em>transport</em>', priority: 8,
-      requests: 15, complete: true, cache_ratio: .58, average_first_token_ms: 1122, first_token_samples: 15,
+      requests: 20, complete: true, cache_ratio: .58, average_first_token_ms: 1122, first_token_samples: 20,
       min_input_tokens: 40000, excluded_small_requests: 9, excluded_unknown_requests: 2,
       status_since: since, failure_kind: 'quality', failure_count: 5, temporary_failures: 1,
       recovery_attempts: 4, recovery_failures: 3, last_failure_at: since, last_recovery_attempt_at: previous,
@@ -353,28 +395,28 @@
         history: [
           window.qualityWindow(at(-60), { cache_ratio: .451, average_first_token_ms: 902, excluded_small_requests: 4,
             excluded_unknown_requests: 1, result: 'abnormal', reason: '账号窗口整体缓存过低', models: [
-              { model: 'gpt-fixture', request_type: 'stream', requests: 10, cache_ratio: .4, average_first_token_ms: 900, first_token_samples: 10 },
-              { model: 'other-model-fixture', request_type: 'sync', requests: 5, cache_ratio: .7, average_first_token_ms: 906, first_token_samples: 5 },
+              { model: 'gpt-fixture', request_type: 'stream', requests: 12, cache_ratio: .4, average_first_token_ms: 900, first_token_samples: 12 },
+              { model: 'other-model-fixture', request_type: 'sync', requests: 8, cache_ratio: .7, average_first_token_ms: 906, first_token_samples: 8 },
             ] }),
           window.qualityWindow(at(-280), { cache_ratio: .733, average_first_token_ms: null,
             first_token_samples: 4, result: 'unknown', reason: '账号窗口首字样本不足', models: [
-              { model: '<img src=x onerror=alert(1)> ui-secret-canary', request_type: 'stream', requests: 15,
+              { model: '<img src=x onerror=alert(1)> ui-secret-canary', request_type: 'stream', requests: 20,
                 cache_ratio: .733, average_first_token_ms: null, first_token_samples: 4 },
             ] }),
           window.qualityWindow(at(-170), { cache_ratio: .922, average_first_token_ms: 812, excluded_small_requests: 6, recorded_at: at(-8), models: [
-            { model: 'other-model-fixture', request_type: 'sync', requests: 15, cache_ratio: .922, average_first_token_ms: 812, first_token_samples: 15 },
+            { model: 'other-model-fixture', request_type: 'sync', requests: 20, cache_ratio: .922, average_first_token_ms: 812, first_token_samples: 20 },
           ] }),
           window.qualityWindow(at(-390), { cache_ratio: .614, average_first_token_ms: 617 }),
         ] },
     });
     Object.assign(window.mock.snapshot.accounts[1], { state: 'manual_change', reason: '运行监控后检测到宿主将账号设为不可调度；已进入手动操作组，保持调度关闭' });
-    Object.assign(window.mock.snapshot.accounts[3], { min_input_tokens: 48000, requests: 15, complete: true,
-      cache_ratio: .6, average_first_token_ms: 950, first_token_samples: 15, excluded_small_requests: 5, excluded_unknown_requests: 1,
+    Object.assign(window.mock.snapshot.accounts[3], { min_input_tokens: 48000, requests: 20, complete: true,
+      cache_ratio: .6, average_first_token_ms: 950, first_token_samples: 20, excluded_small_requests: 5, excluded_unknown_requests: 1,
       quality_sampling: { window_known: true, min_input_tokens: 48000, requests: 9, first_token_samples: 8,
         excluded_small_requests: 7, excluded_unknown_requests: 0, bad_windows: 0, good_windows: 0,
         history: [window.qualityWindow(at(-42), { min_input_tokens: 48000, cache_ratio: .335, average_first_token_ms: 1510,
           excluded_small_requests: 5, excluded_unknown_requests: 1, result: 'unknown', reason: '常开组仅观察', models: [
-            { model: 'always-fixture', request_type: 'stream', requests: 15, cache_ratio: .335, average_first_token_ms: 1510, first_token_samples: 15 },
+            { model: 'always-fixture', request_type: 'stream', requests: 20, cache_ratio: .335, average_first_token_ms: 1510, first_token_samples: 20 },
           ] })] },
     });
   });
@@ -390,42 +432,109 @@
     await monitorButton('2082').locator('.monitor-retry-countdown').count() === 0 &&
     !(await unavailable('reserve').innerText()).includes('运行监控后检测到宿主'), 'unavailable rows use recovery/manual status labels without repeating the full explanation');
   assert(await unavailable('reserve').locator('.monitor-identity').innerText() === '备用 API Key\nID 2082' &&
-    (await unavailable('reserve').locator('thead th').allTextContents()).join('|') === '账号|采用倍率|调度情况|缓存比例|采样|平均首字时间|运行状态', 'unavailable rows reuse the complete normal-account format');
+    (await unavailable('reserve').locator('thead th').allTextContents()).join('|') === '账号|采用倍率|调度情况|当前进度|缓存比例|平均首字时间|运行状态', 'unavailable rows reuse the current and period layout');
   assert(await row('2081').locator('.row-edit').isDisabled() && await row('2082').locator('.row-schedule').isDisabled(), 'exception account settings stay locked while running');
   assert(await monitorRow('2081').count() === 1 && await monitorRow('2081').evaluate((node) =>
-    node.classList.contains('monitor-window-row') && [...node.cells].filter((cell) => cell.rowSpan === 3).length === 4),
-  'three completed windows share one identity, rate, schedule and state row');
-  assert(await historyRows('2081').count() === 2 && (await monitorRow('2081').innerText()).includes('45.1%') &&
-    (await historyRows('2081').nth(0).innerText()).includes('92.2%') && (await historyRows('2081').nth(1).innerText()).includes('73.3%') &&
-    !(await monitor.innerText()).includes('61.4%'), 'monitor shows latest three completed account windows by window end rather than publication time');
+    node.classList.contains('monitor-window-row') && node.cells.length === 7),
+  'current and previous rows share one identity, rate, schedule and state');
+  assert(await historyRows('2081').count() === 3 &&
+    (await historyRows('2081').nth(0).innerText()).includes('45.1%') &&
+    await historyRows('2081').nth(0).isVisible() && await historyRows('2081').nth(1).isHidden() &&
+    await historyRows('2081').nth(2).isHidden(), 'period one is visible and later periods are collapsed');
   const windowMetric = (row, name) => row.locator(`.monitor-window-${name}`).innerText();
-  const newestCache = await windowMetric(monitorRow('2081'), 'cache');
-  const newestSample = await windowMetric(monitorRow('2081'), 'sample');
-  assert(newestCache === '45.1%' && newestSample.includes('周期 1 · 异常') && newestSample.includes('–') &&
-    (await windowMetric(historyRows('2081').nth(0), 'sample')).includes('周期 2 · 健康') &&
-    (await windowMetric(historyRows('2081').nth(1), 'sample')).includes('周期 3 · 未知') &&
+  const newestCache = await monitorRow('2081').locator('.monitor-window-cache').innerText();
+  const newestSample = await monitorRow('2081').locator('.monitor-current-progress').innerText();
+  const previousCache = await windowMetric(historyRows('2081').nth(1), 'cache');
+  const previousSample = await historyRows('2081').nth(1).innerText();
+  assert(newestCache === '58.0%' &&
+    (await monitorRow('2081').locator('.monitor-window-ttft').innerText()).includes('1122ms') &&
+    newestSample.includes('有效 6/20') &&
+    previousCache.includes('92.2%') && previousSample.includes('周期 2') && previousSample.includes('有效 20/20') &&
+    (await windowMetric(historyRows('2081').nth(1), 'ttft')).includes('812ms') &&
     !(await monitor.innerText()).includes('gpt-fixture') && !(await monitor.innerText()).includes('scan-capped-fixture') &&
-    await monitorRow('2081').locator('.monitor-identity').innerText() === '主力 API Key\nID 2081', 'cycle labels and times live in sampling cells while cache and account cells omit model names');
-  const currentProgress = monitorRow('2081').locator('.monitor-window-sample details.monitor-current-sampling');
-  assert(!await currentProgress.evaluate((node) => node.open), 'current progress is collapsed to keep completed cycles compact');
-  await currentProgress.locator('summary').click();
+    await monitorRow('2081').locator('.monitor-identity').innerText() === '主力 API Key\nID 2081', `cycle labels and times live with TTFT (${newestCache}|${previousCache}|${previousSample})`);
+  const currentProgress = monitorRow('2081').locator('.monitor-current-progress');
   const currentSample = await currentProgress.innerText();
-  assert(currentSample.includes('有效 6/15') && currentSample.includes('剔除 3：小请求 2 / 容量未知 1') &&
-    !currentSample.includes('有效 0/15') &&
-    !currentSample.includes('小请求 9') && !currentSample.includes('gpt-fixture'),
-    'sampling-cell progress shows one account window with effective and excluded counts');
-  await currentProgress.locator('summary').click();
+  assert(currentSample.includes('有效 6/20') && currentSample.includes('剔除 3：小请求 2 / 容量未知 1') &&
+    !currentSample.includes('均值 16') && !currentSample.includes('小请求 9') && !currentSample.includes('gpt-fixture'),
+    'sampling-cell shows the latest completed window without model details');
+  const originalProgress = await currentProgress.elementHandle();
+  const originalEvent = await ui.locator('#event-rows > tr').first().elementHandle();
+  const unchangedDataStamp = await stampStatus();
+  await poll();
+  await waitForStatus(unchangedDataStamp);
+  assert(await originalProgress.evaluate((node) => node.isConnected) &&
+    await originalEvent.evaluate((node) => node.isConnected), 'unchanged account and event data retain the open sampling disclosure and event row');
+  await page.evaluate(() => {
+    const at = (secs) => new Date(Date.now() + secs * 1000).toISOString();
+    const account = window.mock.snapshot.accounts[0];
+    account.quality_sampling = {
+      ...account.quality_sampling,
+      requests: 0,
+      first_token_samples: 0,
+      cache_ratio: null,
+      average_first_token_ms: null,
+      models: [],
+      history: [window.qualityWindow(at(-20), {
+        requests: 20,
+        cache_ratio: .812,
+        average_first_token_ms: 912,
+        first_token_samples: 20,
+        excluded_small_requests: 2,
+        excluded_unknown_requests: 0,
+      })],
+    };
+    Object.assign(account, { requests: 0, cache_ratio: null, average_first_token_ms: null, first_token_samples: 0 });
+  });
+  await poll();
+  assert(await historyRows('2081').count() === 1 &&
+    (await historyRows('2081').first().innerText()).includes('周期 1') &&
+    (await historyRows('2081').first().innerText()).includes('81.2%') &&
+    (await monitorRow('2081').locator('.monitor-current-progress').innerText()).includes('有效 0/20'),
+    'the first just-sealed window remains visible after the live window resets');
+  await page.evaluate(() => {
+    const at = (secs) => new Date(Date.now() + secs * 1000).toISOString();
+    const account = window.mock.snapshot.accounts[0];
+    account.quality_sampling = {
+      ...account.quality_sampling,
+      requests: 6,
+      first_token_samples: 6,
+      models: [
+        { model: 'gpt-fixture', request_type: 'stream', requests: 4, cache_ratio: .8, average_first_token_ms: 810, first_token_samples: 4 },
+        { model: 'other-model-fixture', request_type: 'sync', requests: 2, cache_ratio: .6, average_first_token_ms: 840, first_token_samples: 2 },
+      ],
+      history: [
+        window.qualityWindow(at(-60), { cache_ratio: .451, average_first_token_ms: 902, excluded_small_requests: 4,
+          excluded_unknown_requests: 1, result: 'abnormal', reason: '账号窗口整体缓存过低', models: [
+            { model: 'gpt-fixture', request_type: 'stream', requests: 12, cache_ratio: .4, average_first_token_ms: 900, first_token_samples: 12 },
+            { model: 'other-model-fixture', request_type: 'sync', requests: 8, cache_ratio: .7, average_first_token_ms: 906, first_token_samples: 8 },
+          ] }),
+        window.qualityWindow(at(-280), { cache_ratio: .733, average_first_token_ms: null, first_token_samples: 4,
+          result: 'unknown', reason: '账号窗口首字样本不足', models: [
+            { model: '<img src=x onerror=alert(1)> ui-secret-canary', request_type: 'stream', requests: 20,
+              cache_ratio: .733, average_first_token_ms: null, first_token_samples: 4 },
+          ] }),
+        window.qualityWindow(at(-170), { cache_ratio: .922, average_first_token_ms: 812, excluded_small_requests: 6,
+          recorded_at: at(-8), models: [
+            { model: 'other-model-fixture', request_type: 'sync', requests: 20, cache_ratio: .922, average_first_token_ms: 812, first_token_samples: 20 },
+          ] }),
+      ],
+    };
+    Object.assign(account, { requests: 6, cache_ratio: .58, average_first_token_ms: 1122, first_token_samples: 6 });
+  });
+  await poll();
+  assert(await historyRows('2081').nth(1).isHidden() && await historyRows('2081').nth(2).isHidden(), 'later completed periods remain collapsed');
   assert(
-    newestSample.includes('有效 15/15 · ≥40K') && newestSample.includes('剔除 5：小请求 4 / 容量未知 1') &&
-    (await windowMetric(historyRows('2081').nth(0), 'sample')).includes('剔除 6：小请求 6 / 容量未知 0') &&
-    (await windowMetric(monitorRow('2081'), 'ttft')).includes('902ms') && (await windowMetric(historyRows('2081').nth(0), 'ttft')).includes('812ms') &&
-    (await windowMetric(historyRows('2081').nth(1), 'ttft')).includes('样本不足 4/15'), 'completed windows retain their own threshold, exclusions and TTFT independently of live progress');
-  assert(await historyRows('2084').count() === 0 && (await monitorRow('2084').innerText()).includes('33.5%') &&
+    previousSample.includes('有效 20/20 · ≥40K') && previousSample.includes('剔除 6：小请求 6 / 容量未知 0') &&
+    (await historyRows('2081').nth(0).locator('.monitor-window-sample > span').getAttribute('title')).includes('各自去掉最高 2 个和最低 2 个值') &&
+    (await windowMetric(historyRows('2081').nth(1), 'ttft')).includes('812ms'), 'completed periods distinguish cache, exclusions and TTFT');
+  assert(await historyRows('2084').count() === 1 && (await historyRows('2084').innerText()).includes('33.5%') &&
     await monitorButton('2084').locator('.monitor-status-label').innerText() === '可调用',
   'one real always-on window is shown with no padded history or quality pause');
   await monitorButton('2081').click();
   const detail = (field) => ui.locator(`#runtime-detail-${field}`).innerText();
   const accountEvents = ui.locator('#runtime-account-events > li');
+  const firstCompletedWindow = await ui.locator('#runtime-quality-windows > li').first().elementHandle();
   assert(await accountEvents.count() === 5 &&
     JSON.stringify(await accountEvents.locator('p').allTextContents()) === JSON.stringify(['操作 20', '操作 19', '操作 18', '操作 17', '操作 16']) &&
     await ui.locator('#runtime-account-events-empty').isHidden(), 'account details show only the latest five operations, newest first');
@@ -441,6 +550,9 @@
     await accountEvents.locator('em').count() === 0 &&
     !(await ui.locator('#runtime-account-events').innerText()).includes('其他账号的操作'),
     'open account details refresh their own operation time, localized action and safe reason without mixing other accounts');
+  assert(await firstCompletedWindow.evaluate((node) => node.isConnected) && !await originalEvent.evaluate((node) => node.isConnected),
+    'event-only changes rebuild the event rows but retain the open account quality windows');
+  await ui.locator('#event-rows').getByText('备用 API Key · ID 2082', { exact: true }).waitFor({ state: 'attached' });
   checks.push('latest five account operations, empty state, live updates and safe display');
   assert((await detail('recovery')).includes('按原组优先级试运行') && (await detail('next-retry')).includes('本次等待 10 分'), 'paused account shows the next retry and actual wait duration');
   assert(await detail('failure-kind') === '质量异常' && await detail('failure-counts') === '5 / 1' && await detail('recovery-counts') === '4 / 3', 'failure and recovery counts are separate');
@@ -454,25 +566,28 @@
   const completedWindows = ui.locator('#runtime-quality-windows > li');
   const detailFilter = await detail('filter');
   assert(detailFilter === '≥40K Token' && await completedWindows.first().locator('.runtime-window-model').count() === 2 &&
-    (await completedWindows.first().locator('.runtime-window-model').nth(0).innerText()).includes('gpt-fixture · 流式 · 10 次有效') &&
-    (await completedWindows.first().locator('.runtime-window-model').nth(1).innerText()).includes('other-model-fixture · 同步 · 5 次有效') &&
-    (await completedWindows.first().locator('.runtime-window-model').nth(0).innerText()).includes('首字 900 ms（10/10）'),
-    'models are usage details inside a single 15-request account window, with no per-model minimum of 15');
+    (await completedWindows.first().locator('.runtime-window-model').nth(0).innerText()).includes('gpt-fixture · 流式 · 12 次有效') &&
+    (await completedWindows.first().locator('.runtime-window-model').nth(1).innerText()).includes('other-model-fixture · 同步 · 8 次有效') &&
+    (await completedWindows.first().locator('.runtime-window-model').nth(0).innerText()).includes('首字 900 ms（12/12）'),
+    'model usage shows all 20 calls across models and their own TTFT sample counts');
+  const firstWindowLines = await completedWindows.nth(0).locator('.runtime-window-line').allTextContents();
   assert(await completedWindows.count() === 3 &&
     JSON.stringify(await completedWindows.locator('strong').allTextContents()) === JSON.stringify(['窗口 1 · 异常', '窗口 2 · 健康', '窗口 3 · 未知']) &&
     (await completedWindows.nth(0).innerText()).includes('账号窗口整体缓存过低') &&
     (await completedWindows.nth(0).innerText()).includes('剔除 5：小请求 4 / 容量未知 1') &&
     (await completedWindows.nth(1).innerText()).includes('缓存 92.2% · 首字 812 ms') &&
-    (await completedWindows.nth(2).innerText()).includes('样本不足 4/15') &&
+    (await completedWindows.nth(2).innerText()).includes('样本不足 4/20') &&
     !(await ui.locator('#runtime-quality').textContent()).includes('缓存 61.4%'),
-    'detail shows the latest three account windows by end time with overall metrics and model details inside');
+    firstWindowLines.some((line) => line.includes('采样 20') && line.includes('剔除 5：小请求 4 / 容量未知 1')) &&
+    firstWindowLines.some((line) => line.includes('有效 20/20')),
+    'detail shows the latest three account windows by end time with separate progress and compact metadata');
   assert((await completedWindows.nth(2).innerText()).includes('<img src=x onerror=alert(1)> [密钥已隐藏]') &&
-    (await completedWindows.nth(2).innerText()).includes('首字 均值未知（4/15）') &&
+    (await completedWindows.nth(2).innerText()).includes('首字 均值未知（4/20）') &&
     await completedWindows.nth(2).locator('img').count() === 0, 'window model labels are safe and unavailable averages retain the actual sample count');
   assert(!await ui.locator('#runtime-quality-current').evaluate((node) => node.open), 'unfinished windows are collapsed separately from completed history');
   await ui.locator('#runtime-quality-current-summary').click();
   assert(await currentWindows.count() === 1 && (await currentWindows.nth(0).innerText()).includes('当前窗口 · 采样中') &&
-    (await currentWindows.nth(0).innerText()).includes('有效 6/15') &&
+    (await currentWindows.nth(0).innerText()).includes('有效 6/20') &&
     (await currentWindows.nth(0).innerText()).includes('剔除 3：小请求 2 / 容量未知 1') &&
     (await currentWindows.nth(0).innerText()).includes('gpt-fixture · 流式 · 4 次有效') &&
     (await currentWindows.nth(0).innerText()).includes('other-model-fixture · 同步 · 2 次有效'),
@@ -483,14 +598,21 @@
     await detail('last-attempt') === timestamps.last_recovery_attempt_at && (await currentWindows.nth(0).innerText()).includes(timestamps.status_since), 'status, failure, attempt and evaluation timestamps come from the snapshot');
   assert((await ui.locator('#runtime-quality-scan-limit').innerText()).includes('部分窗口可能未列出') &&
     await ui.locator('#runtime-quality-scan-limit').isVisible(), 'bounded quality scan warns that some windows may be omitted');
-  await page.evaluate(() => { window.mock.snapshot.accounts[0].quality_sampling.window_known = false; });
+  await page.evaluate(() => {
+    window.mock.snapshot.accounts[0].quality_sampling.window_known = false;
+    window.mock.snapshot.accounts[1].name = '备用 API Key · 已更新';
+  });
   await poll();
+  await ui.locator('#event-rows').getByText('备用 API Key · 已更新 · ID 2082', { exact: true }).waitFor({ state: 'attached' });
   const unknownWindow = await currentWindows.first().innerText();
   assert(unknownWindow.includes('当前窗口 · 未知') && unknownWindow.includes('进度与剔除数未知') &&
-    !unknownWindow.includes('有效 0/15') && !unknownWindow.includes('小请求 0') &&
+    !unknownWindow.includes('有效 0/20') && !unknownWindow.includes('小请求 0') &&
     await currentWindows.first().locator('.runtime-window-model').count() === 0,
     'scan-capped current account window shows unknown and hides unverified model counts');
-  await page.evaluate(() => { window.mock.snapshot.accounts[0].quality_sampling.window_known = true; });
+  await page.evaluate(() => {
+    window.mock.snapshot.accounts[0].quality_sampling.window_known = true;
+    window.mock.snapshot.accounts[1].name = '备用 API Key';
+  });
   await poll();
   const retryBefore = await detail('next-retry');
   const tableRetryBefore = await monitorButton('2081').locator('.monitor-retry-countdown').innerText();
@@ -564,8 +686,8 @@
   assert(await detail('group') === '常开组 · 独立并行' && await detail('priority') === '当前 5 · 配置 5' &&
     await detail('quality-windows') === '常开组不执行质量规则' && await completedWindows.count() === 1 &&
     (await completedWindows.first().innerText()).includes('常开组仅观察') &&
-    (await completedWindows.first().innerText()).includes('有效 15/15 · ≥48K') &&
-    (await completedWindows.first().innerText()).includes('always-fixture · 流式 · 15 次有效') &&
+    (await completedWindows.first().innerText()).includes('采样 20 · 均值 16 · ≥48K') &&
+    (await completedWindows.first().innerText()).includes('always-fixture · 流式 · 20 次有效') &&
     (await detail('next-retry')).includes('本次等待 5 分 20 秒') && await detail('error-requests') === '宿主暂不提供，不能统计502',
     'always-on temporary faults show actual retry base, observational history, no quality enforcement or false zero errors');
   await ui.locator('[data-close-runtime]').last().click();
@@ -573,8 +695,8 @@
     state: 'account_error', status: 'error', failure_kind: 'account', next_retry_at: null, reason: '账号状态为 error',
   }));
   await poll();
-  await monitorButton('2084').getByText('账号异常 · 需人工处理').waitFor();
-  assert(await unavailable('always_on').locator('.exception-row.account-error').count() === 1, 'host account error is not a manual-change row');
+  assert(await monitorButton('2084').innerText() === '账号异常 · 需人工处理', 'host account error uses the manual-action badge');
+  assert(await monitorButton('2084').getAttribute('class') === 'monitor-status account-error', 'host account error is not a manual-change state');
   await monitorButton('2084').click();
   assert(await detail('failure-kind') === '账号异常' && await detail('next-retry') === '—' &&
     (await detail('recovery')).includes('不会自动清除宿主账号错误'), 'host account errors never promise auto-clear or recovery retry');
@@ -618,7 +740,7 @@
   assert(await row('2082').locator('.row-remove').isDisabled(), 'account removal locks while automation is enabled');
   await save(() => ui.locator('#automation-toggle').click());
   assert(!(await saved()).automation_enabled, 'automation can be closed to unlock settings');
-  assert(!(await monitor.innerText()).match(/850ms|78\.0%|15 \/ 15/), 'stop hides usage even if the host keeps returning the active snapshot');
+  assert(!(await monitor.innerText()).match(/850ms|78\.0%|采样 20/), 'stop hides usage even if the host keeps returning the active snapshot');
   assert(await monitor.locator('.monitor-history-row').count() === 0 && !(await monitor.innerText()).includes('45.1%'), 'stop immediately discards completed-window history for all groups');
   assert(await monitor.locator('.exception-row').count() === 0, 'stop clears runtime exceptions even while the previous snapshot is returned');
   assert(await row('2081').count() === 1 && await row('2082').count() === 1 && !(await row('2081').locator('.row-edit').isDisabled()) && !(await row('2082').locator('.row-schedule').isDisabled()), 'all managed accounts remain editable after stop');

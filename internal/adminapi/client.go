@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"math/big"
 	"net/http"
 	"net/url"
 	"sort"
@@ -94,6 +95,7 @@ type Window struct {
 	InputTokens             int64
 	CacheCreationTokens     int64
 	CacheReadTokens         int64
+	CacheRatio              *float64
 	AccountRate             *float64
 	Complete                bool
 	AverageFirstTokenMs     *float64
@@ -114,21 +116,12 @@ type Window struct {
 	ExcludedUnknownRequests int
 }
 
-func (w Window) Ratio() *float64 {
-	if !w.Complete || w.Requests == 0 {
-		return nil
-	}
-	return cacheRatio(w.InputTokens, w.CacheCreationTokens, w.CacheReadTokens)
-}
-
 // A QualityWindow contains consecutive eligible calls across the account.
 // Models explain its usage composition but never define window boundaries.
 type QualityWindow struct {
 	Requests                int
 	WindowKnown             bool
-	InputTokens             int64
-	CacheCreationTokens     int64
-	CacheReadTokens         int64
+	CacheRatio              *float64
 	AverageFirstTokenMs     *float64
 	FirstTokenSamples       int
 	FirstSample             string
@@ -137,13 +130,6 @@ type QualityWindow struct {
 	ExcludedSmallRequests   int
 	ExcludedUnknownRequests int
 	Models                  []QualityModelUsage
-}
-
-func (w QualityWindow) Ratio() *float64 {
-	if !w.WindowKnown {
-		return nil
-	}
-	return cacheRatio(w.InputTokens, w.CacheCreationTokens, w.CacheReadTokens)
 }
 
 type QualityModelUsage struct {
@@ -159,6 +145,65 @@ type qualityTotals struct {
 	requests, firstTokenSamples             int
 	inputTokens, creationTokens, readTokens int64
 	ttftSum                                 float64
+}
+
+type qualitySamples struct {
+	cache                   [config.QualityWindowRequests]*big.Rat
+	ttft                    [config.QualityWindowRequests]int64
+	requests, ttftAvailable int
+}
+
+func (s *qualitySamples) add(u Usage, total int64) {
+	s.cache[s.requests] = new(big.Rat).SetFrac(big.NewInt(*u.CacheReadTokens), big.NewInt(total))
+	s.requests++
+	if u.FirstTokenMs != nil && *u.FirstTokenMs >= 0 {
+		s.ttft[s.ttftAvailable] = *u.FirstTokenMs
+		s.ttftAvailable++
+	}
+}
+
+func (s *qualitySamples) averages() (cache, ttft *float64) {
+	cache = qualityCacheAverage(s.cache[:s.requests])
+	if s.ttftAvailable == s.requests {
+		ttft = qualityAverage(s.ttft[:s.ttftAvailable])
+	}
+	return cache, ttft
+}
+
+func trimEnds(length int) (start, end int) {
+	if length == config.QualityWindowRequests {
+		const trimPerSide = 2
+		return trimPerSide, length - trimPerSide
+	}
+	return 0, length
+}
+
+func qualityCacheAverage(values []*big.Rat) *float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i].Cmp(values[j]) < 0 })
+	start, end := trimEnds(len(values))
+	sum := new(big.Rat)
+	for _, value := range values[start:end] {
+		sum.Add(sum, value)
+	}
+	mean, _ := new(big.Rat).Quo(sum, big.NewRat(int64(end-start), 1)).Float64()
+	return &mean
+}
+
+func qualityAverage(values []int64) *float64 {
+	if len(values) == 0 {
+		return nil
+	}
+	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
+	start, end := trimEnds(len(values))
+	sum := new(big.Int)
+	for _, value := range values[start:end] {
+		sum.Add(sum, big.NewInt(value))
+	}
+	mean, _ := new(big.Rat).SetFrac(sum, big.NewInt(int64(end-start))).Float64()
+	return &mean
 }
 
 func (s *qualityTotals) add(u Usage) {
@@ -222,8 +267,8 @@ func newerUsage(a, b Usage) bool {
 	return a.CreatedAt.After(b.CreatedAt)
 }
 
-// RecentUsage reads the latest calls for cache metrics, and independently the
-// latest valid TTFT observations, both using the configured fixed window size.
+// RecentUsage calculates rolling cache and TTFT metrics over the same latest
+// eligible calls. TTFT needs an observation for every call in the window.
 // A fixed upper timestamp excludes calls arriving during pagination.
 func (c *Client) RecentUsage(ctx context.Context, id int64, until time.Time) (Window, error) {
 	return c.RecentUsageSince(ctx, id, time.Time{}, until, config.DefaultMinInputTokens)
@@ -234,15 +279,26 @@ func (c *Client) RecentUsage(ctx context.Context, id int64, until time.Time) (Wi
 // both metrics and never treat management errors as usage.
 func (c *Client) RecentUsageSince(ctx context.Context, id int64, since, until time.Time, minInputTokens int64) (Window, error) {
 	const sampleSize, pageSize, maxPages = config.QualityWindowRequests, 100, 50
-	w := Window{Complete: true, FirstTokenComplete: true, MinInputTokens: minInputTokens}
+	w := Window{Complete: true, MinInputTokens: minInputTokens}
 	seen := map[int64]struct{}{}
-	var ttftSum float64
+	var rolling qualitySamples
 	var previous Usage
+	finish := func() {
+		w.FirstTokenComplete = w.Complete && rolling.ttftAvailable == sampleSize
+		if w.Complete {
+			cache, ttft := rolling.averages()
+			w.CacheRatio = cache
+			if w.FirstTokenComplete {
+				w.AverageFirstTokenMs = ttft
+			}
+		}
+	}
 	fail := func(err error, invalidateAggregate bool) (Window, error) {
 		w.qualityRows = nil // Never seal a window from failed pagination.
-		if invalidateAggregate || w.Requests < sampleSize || w.FirstTokenSamples < sampleSize {
-			w.Complete, w.FirstTokenComplete, w.AverageFirstTokenMs = false, false, nil
+		if invalidateAggregate || w.Requests < sampleSize {
+			w.Complete = false
 		}
+		finish()
 		return w, err
 	}
 	query := url.Values{"account_id": {strconv.FormatInt(id, 10)},
@@ -299,39 +355,28 @@ func (c *Client) RecentUsageSince(ctx context.Context, id int64, since, until ti
 			if w.AccountRate == nil && u.AccountRate != nil && validNumber(*u.AccountRate) {
 				w.AccountRate = u.AccountRate
 			}
-			total, capacityKnown := u.inputContext()
-			if !capacityKnown || total < minInputTokens {
-				if w.Requests < sampleSize {
-					countExcluded(capacityKnown, &w.ExcludedSmallRequests, &w.ExcludedUnknownRequests)
-				}
-			}
-			key := u.CreatedAt.UTC().Format(time.RFC3339Nano) + ":" + strconv.FormatInt(u.ID, 10)
-			ttftKnown := u.FirstTokenMs != nil && *u.FirstTokenMs >= 0
-			eligible := capacityKnown && total >= minInputTokens
-			if eligible {
-				if w.Requests < sampleSize {
-					if w.SampleKey == "" {
-						w.SampleKey = key
-					}
-					w.Requests++
-					w.SampleEndKey = key
-					w.InputTokens += *u.InputTokens
-					w.CacheCreationTokens += *u.CacheCreationTokens
-					w.CacheReadTokens += *u.CacheReadTokens
-				}
-				if w.FirstTokenSamples < sampleSize && ttftKnown {
-					if w.FirstTokenSampleKey == "" {
-						w.FirstTokenSampleKey = key
-					}
-					w.FirstTokenSamples++
-					ttftSum += float64(*u.FirstTokenMs)
-					if w.FirstTokenSamples == sampleSize {
-						value := ttftSum / sampleSize
-						w.AverageFirstTokenMs = &value
-					}
-				}
-			}
 			w.qualityRows = append(w.qualityRows, u)
+			if w.Requests < sampleSize && qualityRequestIdentity(u) {
+				total, capacityKnown := u.inputContext()
+				if !capacityKnown || total < minInputTokens {
+					countExcluded(capacityKnown, &w.ExcludedSmallRequests, &w.ExcludedUnknownRequests)
+					continue
+				}
+				key := sampleKey(u)
+				if w.SampleKey == "" {
+					w.SampleKey = key
+				}
+				if w.FirstTokenSampleKey == "" && u.FirstTokenMs != nil && *u.FirstTokenMs >= 0 {
+					w.FirstTokenSampleKey = key
+				}
+				w.Requests++
+				w.SampleEndKey = key
+				w.InputTokens += *u.InputTokens
+				w.CacheCreationTokens += *u.CacheCreationTokens
+				w.CacheReadTokens += *u.CacheReadTokens
+				rolling.add(u, total)
+				w.FirstTokenSamples = rolling.ttftAvailable
+			}
 		}
 		if len(items) == pageSize && !advanced {
 			return fail(errors.New("用量分页未前进，未执行自动判定"), true)
@@ -341,14 +386,14 @@ func (c *Client) RecentUsageSince(ctx context.Context, id int64, since, until ti
 		}
 		if page == maxPages {
 			w.QualityScanLimitReached = true
-			w.FirstTokenLimitReached = w.FirstTokenSamples < sampleSize
-			w.FirstTokenComplete = !w.FirstTokenLimitReached
+			w.FirstTokenLimitReached = w.Requests < sampleSize
 			if w.Requests < sampleSize {
 				w.Complete = false
 			}
 		}
 	}
 	w.qualityOldest, w.qualityRead = previous, true
+	finish()
 	return w, nil
 }
 
@@ -439,17 +484,13 @@ func (w *Window) SealQuality(since time.Time, after string) {
 		return
 	}
 	type modelKey struct{ model, requestType string }
-	totals := qualityTotals{}
+	samples := qualitySamples{}
 	models := map[modelKey]*qualityTotals{}
 	finish := func() {
-		current.InputTokens, current.CacheCreationTokens, current.CacheReadTokens =
-			totals.inputTokens, totals.creationTokens, totals.readTokens
-		current.FirstTokenSamples = totals.firstTokenSamples
 		// A missing TTFT never makes an otherwise complete account window
 		// look healthy. Per-model averages are diagnostic and show their sample counts.
-		if totals.firstTokenSamples == totals.requests {
-			current.AverageFirstTokenMs = totals.averageTTFT()
-		}
+		current.CacheRatio, current.AverageFirstTokenMs = samples.averages()
+		current.FirstTokenSamples = samples.ttftAvailable
 		current.Models = make([]QualityModelUsage, 0, len(models))
 		for key, model := range models {
 			current.Models = append(current.Models, QualityModelUsage{Model: key.model, RequestType: key.requestType,
@@ -483,7 +524,7 @@ func (w *Window) SealQuality(since time.Time, after string) {
 		}
 		current.LastSample = sample
 		current.Requests++
-		totals.add(u)
+		samples.add(u, total)
 		key := modelKey{u.Model, u.RequestType}
 		if models[key] == nil {
 			models[key] = &qualityTotals{}
@@ -493,7 +534,7 @@ func (w *Window) SealQuality(since time.Time, after string) {
 			finish()
 			w.QualityWindows = append(w.QualityWindows, current)
 			current = QualityWindow{MinInputTokens: w.MinInputTokens, WindowKnown: true}
-			totals, models = qualityTotals{}, map[modelKey]*qualityTotals{}
+			samples, models = qualitySamples{}, map[modelKey]*qualityTotals{}
 		}
 	}
 	finish()
@@ -657,6 +698,7 @@ func (c *Client) UsageWindow(ctx context.Context, id int64, from, until time.Tim
 			}
 		}
 		if len(*data.Items) < pageSize || reachedStart {
+			window.CacheRatio = cacheRatio(window.InputTokens, window.CacheCreationTokens, window.CacheReadTokens)
 			return window, nil
 		}
 	}

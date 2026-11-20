@@ -42,9 +42,9 @@ go run ./cmd/packager keygen \
 & $go run ./cmd/packager build `
   -private-key (Join-Path $keys "publisher.pem") `
   -key-id local-cache-rate-manager-v1 `
-  -version 0.1.1 -host-version 0.2.23 `
+  -version 0.1.2-Beta1 -host-version 0.2.23 `
   -targets linux/amd64,linux/arm64,windows/amd64 `
-  -out dist/sub2api-scheduling-plugin-0.1.1.s2plugin `
+  -out dist/sub2api-scheduling-plugin-0.1.2-Beta1.s2plugin `
   -go $go
 ```
 
@@ -52,7 +52,7 @@ go run ./cmd/packager keygen \
 
 产物包括：
 
-- `dist/sub2api-scheduling-plugin-0.1.1.s2plugin`：ZIP 根目录只有清单和签名，另含 `runtimes/` 与 `ui/` 的已声明文件；不会复制私钥或源码。
+- `dist/sub2api-scheduling-plugin-0.1.2-Beta1.s2plugin`：ZIP 根目录只有清单和签名，另含 `runtimes/` 与 `ui/` 的已声明文件；不会复制私钥或源码。
 - `dist/trusted-publisher.yaml`：只含发行公钥的宿主配置片段，可以交给部署者审核。它在包外，未作为运行时文件打包。
 
 输出文件通过临时文件提交；同名构建产物会被替换，请为需要保留的历史版本选择不同的 `-out`。`manifest.json` 的原始字节由 Ed25519 签名，不应在签名之后修改或重新排版。清单和签名不列入 `manifest.files`，其余每个条目必须有且只有一个哈希声明。

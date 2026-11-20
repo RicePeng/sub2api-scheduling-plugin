@@ -30,7 +30,7 @@ import (
 
 const (
 	pluginID       = "local.cache-rate-manager"
-	defaultVersion = "0.1.1"
+	defaultVersion = "0.1.2-Beta1"
 	defaultHost    = "0.2.23"
 	defaultKeyID   = "local-cache-rate-manager-v1"
 	defaultTargets = "linux/amd64,linux/arm64,windows/amd64"

@@ -19,10 +19,10 @@ func reply(w http.ResponseWriter, data any) {
 
 func tokenValue(value int64) *int64 { return &value }
 
-func TestRecentUsageSeparatesLastFifteenCallsFromValidTTFT(t *testing.T) {
+func TestRecentUsageCannotFillMissingTTFTFromOlderCalls(t *testing.T) {
 	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
 	makeUsage := func(id int64, ttft *int64) Usage {
-		return Usage{ID: id, AccountID: 7, CreatedAt: now.Add(-time.Duration(id) * time.Second),
+		return Usage{ID: id, AccountID: 7, CreatedAt: now.Add(-time.Duration(id) * time.Second), Model: "a", RequestType: "stream",
 			InputTokens: tokenValue(10000), CacheCreationTokens: tokenValue(0), CacheReadTokens: tokenValue(30000), FirstTokenMs: ttft}
 	}
 	calls := 0
@@ -39,10 +39,7 @@ func TestRecentUsageSeparatesLastFifteenCallsFromValidTTFT(t *testing.T) {
 			future.CreatedAt = now.Add(time.Second)
 			items = append(items, future)
 			for id := int64(1); id <= 99; id++ {
-				var ttft *int64
-				if id%10 == 0 {
-					ttft = tokenValue(id * 10)
-				}
+				ttft := tokenValue(id * 10)
 				if id == 1 {
 					ttft = tokenValue(-1)
 				}
@@ -60,24 +57,22 @@ func TestRecentUsageSeparatesLastFifteenCallsFromValidTTFT(t *testing.T) {
 	client := New(server.URL, "key", time.Second)
 	defer client.Close()
 	w, err := client.RecentUsage(context.Background(), 7, now)
-	// TTFT: 100..900 (9 observations), then 1000..1050 (6 observations).
-	wantAverage := float64(4500+6150) / 15
-	if err != nil || calls != 2 || !w.Complete || !w.FirstTokenComplete || w.Requests != 15 || w.FirstTokenSamples != 15 ||
-		w.InputTokens != 150000 || w.CacheReadTokens != 450000 || w.AverageFirstTokenMs == nil || *w.AverageFirstTokenMs != wantAverage {
+	if err != nil || calls != 2 || !w.Complete || w.FirstTokenComplete || w.Requests != 20 || w.FirstTokenSamples != 19 ||
+		w.InputTokens != 200000 || w.CacheReadTokens != 600000 || w.AverageFirstTokenMs != nil {
 		t.Fatalf("recent window=%+v calls=%d error=%v", w, calls, err)
 	}
-	if w.SampleKey == w.FirstTokenSampleKey || w.Ratio() == nil || *w.Ratio() != .75 {
-		t.Fatal("independent cache and TTFT samples were lost")
+	if w.SampleKey == w.FirstTokenSampleKey || w.CacheRatio == nil || *w.CacheRatio != .75 {
+		t.Fatal("known cache metrics or available TTFT cursor were lost")
 	}
 }
 
 func TestRecentUsageInsufficientTTFTAndMissingTokensStayUnknown(t *testing.T) {
 	now := time.Now().UTC()
 	items := []Usage{}
-	for id := int64(1); id <= 15; id++ {
-		u := Usage{ID: id, AccountID: 7, CreatedAt: now.Add(-time.Duration(id) * time.Second),
+	for id := int64(1); id <= 20; id++ {
+		u := Usage{ID: id, AccountID: 7, CreatedAt: now.Add(-time.Duration(id) * time.Second), Model: "a", RequestType: "sync",
 			InputTokens: tokenValue(10000), CacheCreationTokens: tokenValue(0), CacheReadTokens: tokenValue(30000)}
-		if id < 15 {
+		if id < 20 {
 			u.FirstTokenMs = tokenValue(0)
 		}
 		items = append(items, u)
@@ -88,10 +83,10 @@ func TestRecentUsageInsufficientTTFTAndMissingTokensStayUnknown(t *testing.T) {
 	client := New(server.URL, "key", time.Second)
 	defer client.Close()
 	w, err := client.RecentUsage(context.Background(), 7, now)
-	if err != nil || w.ExcludedUnknownRequests != 1 || w.Requests != 14 || w.FirstTokenSamples != 13 || w.AverageFirstTokenMs != nil {
+	if err != nil || w.ExcludedUnknownRequests != 1 || w.Requests != 19 || w.FirstTokenSamples != 18 || w.AverageFirstTokenMs != nil {
 		t.Fatalf("unknown observations treated as known: %+v %v", w, err)
 	}
-	items[14].FirstTokenMs = tokenValue(0)
+	items[19].FirstTokenMs = tokenValue(0)
 	items[0].InputTokens = tokenValue(10000)
 	w, err = client.RecentUsage(context.Background(), 7, now)
 	if err != nil || w.AverageFirstTokenMs == nil || *w.AverageFirstTokenMs != 0 {
@@ -108,7 +103,7 @@ func TestRecentUsageStopsAtSessionBoundaryAndKeepsCacheAtScanLimit(t *testing.T)
 		limited         bool
 	}{
 		{"fresh session", 3 * time.Second, 1, 3, false},
-		{"TTFT missing after scan limit", 2 * time.Hour, 50, 15, true},
+		{"TTFT missing after scan limit", 2 * time.Hour, 50, 20, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			calls := 0
@@ -135,8 +130,8 @@ func TestRecentUsageStopsAtSessionBoundaryAndKeepsCacheAtScanLimit(t *testing.T)
 			defer client.Close()
 			window, err := client.RecentUsageSince(context.Background(), 7, since, now, 40000)
 			window.SealQuality(since, "")
-			if err != nil || calls != tc.pages || window.Requests != tc.requests || window.FirstTokenLimitReached != tc.limited ||
-				window.FirstTokenSamples != 0 || window.AverageFirstTokenMs != nil || window.Ratio() == nil || *window.Ratio() != .75 {
+			if err != nil || calls != tc.pages || window.Requests != tc.requests || window.FirstTokenLimitReached ||
+				window.FirstTokenSamples != 0 || window.AverageFirstTokenMs != nil || window.CacheRatio == nil || *window.CacheRatio != .75 {
 				t.Fatalf("unexpected aggregate sampling: requests=%d, pages=%d, error=%v", window.Requests, calls, err)
 			}
 			current := window.QualityCurrent
@@ -153,8 +148,8 @@ func TestRecentUsageStopsAtSessionBoundaryAndKeepsCacheAtScanLimit(t *testing.T)
 			if window.QualityCurrent.WindowKnown || len(window.QualityWindows) != 0 {
 				t.Fatal("a cursor outside the scanned range incorrectly proved alignment")
 			}
-			window.SealQuality(since, now.Add(-18*time.Second).Format(time.RFC3339Nano)+":18")
-			if len(window.QualityWindows) != 1 || window.QualityWindows[0].Requests != 15 ||
+			window.SealQuality(since, now.Add(-23*time.Second).Format(time.RFC3339Nano)+":23")
+			if len(window.QualityWindows) != 1 || window.QualityWindows[0].Requests != 20 ||
 				window.QualityWindows[0].AverageFirstTokenMs != nil || window.QualityCurrent.Requests != 2 {
 				t.Fatalf("verified anchor at the scan limit did not seal: current=%+v, windows=%+v", window.QualityCurrent, window.QualityWindows)
 			}
@@ -162,7 +157,7 @@ func TestRecentUsageStopsAtSessionBoundaryAndKeepsCacheAtScanLimit(t *testing.T)
 	}
 }
 
-func TestRecentUsageQualityCombinesModelsAndRequestTypesAcrossPages(t *testing.T) {
+func TestRecentUsageIndependentlyTrimsAccountMetricsAcrossPages(t *testing.T) {
 	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
 	shared, since := now.Add(-time.Second), now.Add(-2*time.Second)
 	usage := func(id int64, at time.Time, model, requestType string, capacity, cache, ttft int64) Usage {
@@ -174,8 +169,15 @@ func TestRecentUsageQualityCombinesModelsAndRequestTypesAcrossPages(t *testing.T
 	for id := int64(199); id >= 101; id-- {
 		kind := []string{"cyber", "unknown", ""}[id%3]
 		u := usage(id, shared, "ineligible", kind, 40000, 0, 10)
-		if id >= 120 && id <= 124 {
-			u = usage(id, shared, "b", "ws_v2", 100000, 90000, 120)
+		if id >= 115 && id <= 124 {
+			cache, ttft := int64(75000), int64(300)
+			if id >= 123 {
+				cache = 100000
+			}
+			if id <= 116 {
+				ttft = 0
+			}
+			u = usage(id, shared, "b", "ws_v2", 100000, cache, ttft)
 		}
 		first = append(first, u)
 	}
@@ -189,7 +191,14 @@ func TestRecentUsageQualityCombinesModelsAndRequestTypesAcrossPages(t *testing.T
 		if id == 91 {
 			at = since
 		}
-		second = append(second, usage(id, at, "a", typ, 40000, 20000, 300))
+		cache, ttft := int64(10000), int64(100)
+		if id <= 92 {
+			cache = 0
+		}
+		if id == 97 || id == 98 {
+			ttft = 10000
+		}
+		second = append(second, usage(id, at, "a", typ, 40000, cache, ttft))
 	}
 	second = append(second, second[1], usage(90, since.Add(-time.Nanosecond), "before", "sync", 40000, 100, 10))
 	calls := 0
@@ -208,21 +217,26 @@ func TestRecentUsageQualityCombinesModelsAndRequestTypesAcrossPages(t *testing.T
 	window.SealQuality(since, "")
 	if err != nil || calls != 2 || window.QualityScanLimitReached || window.QualityCurrent == nil ||
 		window.QualityCurrent.Requests != 0 || len(window.QualityWindows) != 1 {
-		t.Fatalf("10+5 eligible calls did not close exactly one account window: current=%+v, windows=%+v, pages=%d, error=%v",
+		t.Fatalf("20 eligible calls did not close exactly one account window: current=%+v, windows=%+v, pages=%d, error=%v",
 			window.QualityCurrent, window.QualityWindows, calls, err)
 	}
 	sealed := window.QualityWindows[0]
 	if sealed.FirstSample != since.Format(time.RFC3339Nano)+":91" ||
-		sealed.LastSample != shared.Format(time.RFC3339Nano)+":124" || sealed.Requests != 15 ||
-		sealed.Ratio() == nil || *sealed.Ratio() != 650000.0/900000 ||
-		sealed.FirstTokenSamples != 15 || sealed.AverageFirstTokenMs == nil || *sealed.AverageFirstTokenMs != 240 {
-		t.Fatalf("incorrect timeline or aggregate token/TTFT weighting: %+v", sealed)
+		sealed.LastSample != shared.Format(time.RFC3339Nano)+":124" || sealed.Requests != 20 ||
+		sealed.CacheRatio == nil || *sealed.CacheRatio != .5 || sealed.FirstTokenSamples != 20 ||
+		sealed.AverageFirstTokenMs == nil || *sealed.AverageFirstTokenMs != 200 ||
+		sealed.ExcludedSmallRequests != 0 || sealed.ExcludedUnknownRequests != 0 {
+		t.Fatalf("incorrect timeline or independently trimmed cache and TTFT: %+v", sealed)
+	}
+	if window.Requests != 20 || window.FirstTokenSamples != 20 || window.CacheRatio == nil || *window.CacheRatio != *sealed.CacheRatio ||
+		window.AverageFirstTokenMs == nil || *window.AverageFirstTokenMs != *sealed.AverageFirstTokenMs {
+		t.Fatalf("rolling and sealed account metrics disagree: %+v, %+v", window, sealed)
 	}
 	want := []struct {
 		model, typ  string
 		count       int
 		ratio, ttft float64
-	}{{"a", "stream", 4, .5, 300}, {"a", "sync", 6, .5, 300}, {"b", "ws_v2", 5, .9, 120}}
+	}{{"a", "stream", 4, .25, 5050}, {"a", "sync", 6, 40000.0 / 240000, 100}, {"b", "ws_v2", 10, .8, 240}}
 	if len(sealed.Models) != len(want) {
 		t.Fatalf("expected exactly three diagnostic model/type groups: %+v", sealed.Models)
 	}
@@ -285,22 +299,22 @@ func TestRecentUsageQualityRejectsUnreliablePagesAndDoesNotMeasureManagement502(
 				window.QualityCurrent != nil || len(window.QualityWindows) != 0 || window.QualityScanLimitReached {
 				t.Fatalf("unreliable quality window was accepted: %+v, %v", window, err)
 			}
-			if tc.status == http.StatusBadGateway && (window.Requests != 15 || !window.Complete || window.AverageFirstTokenMs == nil || *window.AverageFirstTokenMs != 10) {
-				t.Fatalf("later management 502 changed already complete legacy metrics: %+v", window)
+			if tc.status == http.StatusBadGateway && (window.Requests != 20 || !window.Complete || window.AverageFirstTokenMs == nil || *window.AverageFirstTokenMs != 10) {
+				t.Fatalf("later management 502 changed already complete rolling metrics: %+v", window)
 			}
 		})
 	}
 }
 
-func TestRecentUsageQualityRequiresFifteenCalls(t *testing.T) {
+func TestRecentUsageQualityRequiresTwentyCalls(t *testing.T) {
 	now := time.Now().UTC()
-	rows := make([]Usage, 15)
+	rows := make([]Usage, 20)
 	for i := range rows {
 		rows[i] = Usage{ID: int64(i + 1), AccountID: 7, CreatedAt: now, Model: "a", RequestType: "sync",
 			InputTokens: tokenValue(10000), CacheCreationTokens: tokenValue(0), CacheReadTokens: tokenValue(30000),
 			FirstTokenMs: tokenValue(42)}
 	}
-	for _, count := range []int{14, 15} {
+	for _, count := range []int{19, 20} {
 		t.Run(strconv.Itoa(count), func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				reply(w, map[string]any{"items": rows[:count]})
@@ -314,15 +328,15 @@ func TestRecentUsageQualityRequiresFifteenCalls(t *testing.T) {
 				t.Fatalf("unexpected aggregate at %d requests: %+v, %v", count, w, err)
 			}
 			b := w.QualityCurrent
-			if count == 14 && (len(w.QualityWindows) != 0 || b.Requests != 14 || len(b.Models) != 1 ||
-				b.Models[0].Requests != 14 || w.AverageFirstTokenMs != nil) {
-				t.Fatalf("14 calls did not stay in the trailing partial window: %+v", b)
+			if count == 19 && (len(w.QualityWindows) != 0 || b.Requests != 19 || len(b.Models) != 1 ||
+				b.Models[0].Requests != 19 || w.AverageFirstTokenMs != nil) {
+				t.Fatalf("19 calls did not stay in the trailing partial window: %+v", b)
 			}
-			if count == 15 && (b.Requests != 0 || len(w.QualityWindows) != 1 ||
-				w.QualityWindows[0].Ratio() == nil || *w.QualityWindows[0].Ratio() != .75 ||
+			if count == 20 && (b.Requests != 0 || len(w.QualityWindows) != 1 ||
+				w.QualityWindows[0].CacheRatio == nil || *w.QualityWindows[0].CacheRatio != .75 ||
 				w.QualityWindows[0].AverageFirstTokenMs == nil || *w.QualityWindows[0].AverageFirstTokenMs != 42 ||
 				w.AverageFirstTokenMs == nil || *w.AverageFirstTokenMs != 42) {
-				t.Fatalf("15 calls did not form a complete window with no remainder: %+v", w.QualityWindows)
+				t.Fatalf("20 calls did not form a complete window with no remainder: %+v", w.QualityWindows)
 			}
 		})
 	}
@@ -342,12 +356,12 @@ func TestRecentUsageCapacityFilterCountsWithinEachWindow(t *testing.T) {
 	unknown := makeRow(97, "a", "sync", 40000)
 	unknown.CacheCreationTokens, unknown.FirstTokenMs = nil, tokenValue(9999)
 	rows := []Usage{firstSmall, makeRow(98, "a", "stream", 39999), unknown, firstSmall}
-	for id := int64(96); id >= 82; id-- {
+	for id := int64(96); id >= 77; id-- {
 		rows = append(rows, makeRow(id, "a", "sync", 40000))
 	}
-	olderUnknown := makeRow(80, "a", "sync", 40000)
+	olderUnknown := makeRow(75, "a", "sync", 40000)
 	olderUnknown.CacheReadTokens = tokenValue(-1)
-	rows = append(rows, makeRow(81, "a", "sync", 39999), olderUnknown)
+	rows = append(rows, makeRow(76, "a", "sync", 39999), olderUnknown)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		reply(w, map[string]any{"items": rows})
 	}))
@@ -357,9 +371,9 @@ func TestRecentUsageCapacityFilterCountsWithinEachWindow(t *testing.T) {
 	for poll := 0; poll < 2; poll++ {
 		w, err := client.RecentUsageSince(context.Background(), 7, now.Add(-time.Hour), now, 40000)
 		w.SealQuality(now.Add(-time.Hour), "")
-		if err != nil || w.MinInputTokens != 40000 || w.Requests != 15 || !w.Complete ||
+		if err != nil || w.MinInputTokens != 40000 || w.Requests != 20 || !w.Complete ||
 			w.ExcludedSmallRequests != 2 || w.ExcludedUnknownRequests != 1 ||
-			w.Ratio() == nil || *w.Ratio() != .625 || w.AverageFirstTokenMs == nil ||
+			w.CacheRatio == nil || *w.CacheRatio != .625 || w.AverageFirstTokenMs == nil ||
 			*w.AverageFirstTokenMs != 42 || w.AccountRate == nil || *w.AccountRate != .7 || w.QualityCurrent == nil {
 			t.Fatalf("poll %d: wrong aggregate filter or exclusions: %+v, %v", poll, w, err)
 		}
@@ -369,8 +383,8 @@ func TestRecentUsageCapacityFilterCountsWithinEachWindow(t *testing.T) {
 			t.Fatalf("poll %d: wrong trailing exclusions or excluded calls appeared as model usage: %+v", poll, current)
 		}
 		sealed := w.QualityWindows[0]
-		if sealed.Requests != 15 || sealed.ExcludedSmallRequests != 1 || sealed.ExcludedUnknownRequests != 1 ||
-			sealed.Ratio() == nil || *sealed.Ratio() != .625 || sealed.AverageFirstTokenMs == nil || *sealed.AverageFirstTokenMs != 42 {
+		if sealed.Requests != 20 || sealed.ExcludedSmallRequests != 1 || sealed.ExcludedUnknownRequests != 1 ||
+			sealed.CacheRatio == nil || *sealed.CacheRatio != .625 || sealed.AverageFirstTokenMs == nil || *sealed.AverageFirstTokenMs != 42 {
 			t.Fatalf("poll %d: wrong sealed account window: %+v", poll, sealed)
 		}
 	}
@@ -414,7 +428,7 @@ func TestUsageWindowDateFilterDedupAndExactBounds(t *testing.T) {
 		window.InputTokens != 10100 || calls != 2 {
 		t.Fatalf("window=%+v calls=%d err=%v", window, calls, err)
 	}
-	if window.Ratio() == nil || *window.Ratio() < .59 {
+	if window.CacheRatio == nil || *window.CacheRatio < .59 {
 		t.Fatal("bad cache ratio")
 	}
 }
@@ -441,7 +455,7 @@ func TestUsageWindowRejectsTruncationAndMismatchedRows(t *testing.T) {
 			client := New(server.URL, "key", time.Second)
 			defer client.Close()
 			window, err := client.UsageWindow(context.Background(), 7, now.Add(-time.Hour), now)
-			if err == nil || window.Complete || window.Ratio() != nil || calls > 50 {
+			if err == nil || window.Complete || window.CacheRatio != nil || calls > 50 {
 				t.Fatalf("unsafe incomplete window: %+v %v %d", window, err, calls)
 			}
 		})
@@ -472,12 +486,12 @@ func TestUsageWindowMissingTokensAndItemsIsIncomplete(t *testing.T) {
 			defer client.Close()
 			window, err := client.UsageWindow(context.Background(), 7, now.Add(-time.Hour), now)
 			if name == `complete-zero` {
-				if err != nil || !window.Complete || window.Ratio() != nil {
+				if err != nil || !window.Complete || window.CacheRatio != nil {
 					t.Fatalf(`valid zero tokens rejected: %+v %v`, window, err)
 				}
 				return
 			}
-			if err == nil || window.Complete || window.Ratio() != nil {
+			if err == nil || window.Complete || window.CacheRatio != nil {
 				t.Fatalf(`incomplete usage was accepted: %+v %v`, window, err)
 			}
 		})

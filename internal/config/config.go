@@ -32,7 +32,7 @@ type Rule struct {
 }
 
 // QualityWindowRequests is the fixed sample size for recent usage and quality rules.
-const QualityWindowRequests = 15
+const QualityWindowRequests = 20
 
 const DefaultMinInputTokens int64 = 40000
 const MaxMinInputTokens int64 = 1000000000

@@ -152,7 +152,7 @@ func account(id int64, platform, kind string, priority int, schedulable bool) ad
 	return adminapi.Account{ID: id, Name: "test", Platform: platform, Type: kind, Status: "active", Schedulable: schedulable, Priority: priority, RateMultiplier: &rate}
 }
 func lowCache() adminapi.Window {
-	return adminapi.Window{Complete: true, Requests: 15, InputTokens: 100, CacheReadTokens: 300}
+	return adminapi.Window{Complete: true, Requests: 20, InputTokens: 100, CacheReadTokens: 300, CacheRatio: ptr(.75)}
 }
 func setup(t *testing.T, accounts ...adminapi.Account) (*Engine, config.Config, *fakeAPI, *memoryStore, time.Time) {
 	t.Helper()
@@ -445,7 +445,7 @@ func TestEarlierGroupAvailabilityAndPerGroupCacheRule(t *testing.T) {
 	rule := c.GroupRules["excellent"]
 	rule.MaxRateMultiplier = 0
 	rule.MinCacheRatio = .8
-	rule.MinRequests = 15
+	rule.MinRequests = 20
 	rule.TriggerSamples = 2
 	rule.CooldownSeconds = 30
 	c.GroupRules["excellent"] = rule
@@ -472,7 +472,7 @@ func TestEarlierGroupAvailabilityAndPerGroupCacheRule(t *testing.T) {
 	}
 }
 
-func TestAverageTTFTThresholdPausesOnlyAfterFifteenValidSamples(t *testing.T) {
+func TestAverageTTFTThresholdPausesOnlyAfterTwentyValidSamples(t *testing.T) {
 	e, c, api, _, now := setup(t, account(7, "openai", "apikey", 5, true))
 	rule := c.GroupRules["general"]
 	rule.MaxRateMultiplier = 0
@@ -487,21 +487,21 @@ func TestAverageTTFTThresholdPausesOnlyAfterFifteenValidSamples(t *testing.T) {
 	e.Cycle(context.Background(), now)
 	at := now.Add(180 * time.Second)
 	b := qualityWindow(at, 100, "model-a", "stream", .9)
-	b.FirstTokenSamples, b.AverageFirstTokenMs = 14, nil
+	b.FirstTokenSamples, b.AverageFirstTokenMs = 19, nil
 	qualityCycle(e, api, at, 7, b)
 	if !api.accounts[7].Schedulable {
-		t.Fatal("14 TTFT samples triggered a pause")
+		t.Fatal("19 TTFT samples triggered a pause")
 	}
 	at = now.Add(360 * time.Second)
 	b = qualityWindow(at, 120, "model-a", "stream", .9)
-	b.FirstTokenSamples, b.AverageFirstTokenMs = 15, ptr(1500)
+	b.FirstTokenSamples, b.AverageFirstTokenMs = 20, ptr(1500)
 	qualityCycle(e, api, at, 7, b)
 	if !api.accounts[7].Schedulable {
 		t.Fatal("incomplete TTFT sample counted toward confirmation")
 	}
 	at = now.Add(540 * time.Second)
 	b = qualityWindow(at, 140, "model-a", "stream", .9)
-	b.FirstTokenSamples, b.AverageFirstTokenMs = 15, ptr(1500)
+	b.FirstTokenSamples, b.AverageFirstTokenMs = 20, ptr(1500)
 	qualityCycle(e, api, at, 7, b)
 	if api.accounts[7].Schedulable {
 		t.Fatal("two complete slow TTFT windows did not pause the account")
@@ -697,13 +697,13 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 		ttftSamples int
 		exits       bool
 	}{
-		{"cache_below", .75, 15, true, 500, 15, true},
-		{"ttft_above", .9, 15, true, 1500, 15, true},
-		{"ttft_independent_of_cache", .9, 0, false, 1500, 15, true},
-		{"cache_boundary", .8, 15, true, 1000, 15, false},
-		{"cache_sample_shortage", .75, 14, true, 500, 15, false},
-		{"cache_incomplete", .75, 15, false, 500, 15, false},
-		{"ttft_sample_shortage", .9, 15, true, 1500, 14, false},
+		{"cache_below", .75, 20, true, 500, 20, true},
+		{"ttft_above", .9, 20, true, 1500, 20, true},
+		{"ttft_independent_of_cache", .9, 0, false, 1500, 20, true},
+		{"cache_boundary", .8, 20, true, 1000, 20, false},
+		{"cache_sample_shortage", .75, 19, true, 500, 20, false},
+		{"cache_incomplete", .75, 20, false, 500, 20, false},
+		{"ttft_sample_shortage", .9, 20, true, 1500, 19, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, b := account(7, "openai", "apikey", 4, true), account(8, "openai", "apikey", 5, true)
@@ -719,7 +719,7 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 			if err := e.Apply(c); err != nil {
 				t.Fatal(err)
 			}
-			healthy := adminapi.Window{Complete: true, Requests: 15, InputTokens: 10, CacheReadTokens: 90, AverageFirstTokenMs: ptr(500), FirstTokenSamples: 15}
+			healthy := adminapi.Window{Complete: true, Requests: 20, CacheRatio: ptr(.9), AverageFirstTokenMs: ptr(500), FirstTokenSamples: 20}
 			api.usage[7], api.usage[8] = healthy, healthy
 			e.Cycle(context.Background(), now)
 			if !api.accounts[7].Schedulable || api.accounts[8].Schedulable {
@@ -727,7 +727,7 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 			}
 			w := healthy
 			w.Requests, w.Complete = tc.requests, tc.complete
-			w.InputTokens, w.CacheReadTokens = int64((1-tc.ratio)*1000+.5), int64(tc.ratio*1000+.5)
+			w.CacheRatio = ptr(tc.ratio)
 			w.AverageFirstTokenMs, w.FirstTokenSamples = ptr(tc.ttft), tc.ttftSamples
 			api.usage[7] = w
 			e.Cycle(context.Background(), now.Add(time.Minute))
