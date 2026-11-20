@@ -1,6 +1,6 @@
 param(
     [Parameter(Mandatory = $true)][string]$PrivateKey,
-    [string]$Version = "0.1.0",
+    [string]$Version = "0.1.1",
     [string]$HostVersion = "0.2.23",
     [string]$KeyId = "local-cache-rate-manager-v1",
     [string]$Targets = "linux/amd64,linux/arm64,windows/amd64",

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/url"
@@ -19,13 +20,22 @@ type Rule struct {
 	ExclusiveMinCacheRatio          float64 `json:"exclusive_min_cache_ratio"`
 	ExclusiveMaxAverageFirstTokenMs float64 `json:"exclusive_max_average_first_token_ms"`
 	MinRequests                     int     `json:"min_requests"`
+	MinInputTokens                  int64   `json:"min_input_tokens"`
 	TriggerSamples                  int     `json:"trigger_samples"`
 	RecoverySamples                 int     `json:"recovery_samples"`
+	ConfirmationSeconds             int     `json:"confirmation_seconds"`
+	RecoverySeconds                 int     `json:"recovery_seconds"`
 	CooldownSeconds                 int     `json:"cooldown_seconds"`
 	Action                          string  `json:"action"`
 	PriorityPenalty                 int     `json:"priority_penalty"`
 	RateSource                      string  `json:"rate_source,omitempty"`
 }
+
+// QualityWindowRequests is the fixed sample size for recent usage and quality rules.
+const QualityWindowRequests = 15
+
+const DefaultMinInputTokens int64 = 40000
+const MaxMinInputTokens int64 = 1000000000
 
 // AccountSetting contains plugin-owned scheduling metadata for one monitored
 // account. The host account itself is never mutated by configuration writes.
@@ -56,16 +66,17 @@ type Config struct {
 	Rule                    Rule                       `json:"rule"`
 }
 
-var groupIDs = []string{"excellent", "good", "general", "reserve", "temporary"}
+var groupIDs = []string{"always_on", "excellent", "good", "general", "reserve", "temporary"}
 
 func DefaultGroupPriorities() map[string]int {
-	return map[string]int{"excellent": 6, "good": 7, "general": 8, "reserve": 9, "temporary": 99}
+	return map[string]int{"always_on": 5, "excellent": 6, "good": 7, "general": 8, "reserve": 9, "temporary": 99}
 }
 
 func defaultRule() Rule {
 	return Rule{MaxRateMultiplier: .2, MinCacheRatio: .8, MaxAverageFirstTokenMs: 10000, ExclusiveRateBelow: .05,
 		ExclusiveMinCacheRatio: .8, ExclusiveMaxAverageFirstTokenMs: 10000,
-		MinRequests: 20, TriggerSamples: 3, RecoverySamples: 3,
+		MinRequests: QualityWindowRequests, MinInputTokens: DefaultMinInputTokens,
+		TriggerSamples: 2, RecoverySamples: 2, ConfirmationSeconds: 180, RecoverySeconds: 300,
 		CooldownSeconds: 300, Action: "pause", PriorityPenalty: 10, RateSource: "account"}
 }
 
@@ -143,7 +154,7 @@ func Decode(raw []byte) (Config, error) {
 		ids = append(ids, id)
 	}
 	c.AccountIDs = ids
-	c.Rule = normalizeRule(c.Rule)
+	c.Rule = NormalizeRule(c.Rule)
 	if err := validateRule(c.Rule); err != nil {
 		return c, err
 	}
@@ -157,7 +168,7 @@ func Decode(raw []byte) (Config, error) {
 		if !containsGroup(id) {
 			return c, errors.New("异常条件包含无效分组")
 		}
-		rule = normalizeRule(rule)
+		rule = NormalizeRule(rule)
 		if err := validateRule(rule); err != nil {
 			return c, err
 		}
@@ -254,7 +265,7 @@ func Decode(raw []byte) (Config, error) {
 			if !containsGroup(group) {
 				return c, errors.New("平台异常条件包含无效分组")
 			}
-			rule = normalizeRule(rule)
+			rule = NormalizeRule(rule)
 			if err := validateRule(rule); err != nil {
 				return c, err
 			}
@@ -275,7 +286,8 @@ func Decode(raw []byte) (Config, error) {
 	return c, nil
 }
 
-func normalizeRule(r Rule) Rule {
+// NormalizeRule applies the current defaults to configuration and stored policy.
+func NormalizeRule(r Rule) Rule {
 	d := defaultRule()
 	if r.ExclusiveMinCacheRatio == 0 {
 		r.ExclusiveMinCacheRatio = d.ExclusiveMinCacheRatio
@@ -283,14 +295,31 @@ func normalizeRule(r Rule) Rule {
 	if r.ExclusiveMaxAverageFirstTokenMs == 0 {
 		r.ExclusiveMaxAverageFirstTokenMs = d.ExclusiveMaxAverageFirstTokenMs
 	}
-	if r.MinRequests == 0 {
-		r.MinRequests = d.MinRequests
+	// Accept previously valid settings without changing the fixed window size.
+	if r.MinRequests >= 0 && r.MinRequests <= 20 {
+		r.MinRequests = QualityWindowRequests
+	}
+	if r.MinInputTokens == 0 {
+		r.MinInputTokens = d.MinInputTokens
 	}
 	if r.TriggerSamples == 0 {
 		r.TriggerSamples = d.TriggerSamples
 	}
 	if r.RecoverySamples == 0 {
 		r.RecoverySamples = d.RecoverySamples
+	}
+	// Old one-poll rules must not bypass independent-window confirmation.
+	if r.TriggerSamples == 1 {
+		r.TriggerSamples = 2
+	}
+	if r.RecoverySamples == 1 {
+		r.RecoverySamples = 2
+	}
+	if r.ConfirmationSeconds == 0 {
+		r.ConfirmationSeconds = d.ConfirmationSeconds
+	}
+	if r.RecoverySeconds == 0 {
+		r.RecoverySeconds = d.RecoverySeconds
 	}
 	if r.CooldownSeconds == 0 {
 		r.CooldownSeconds = d.CooldownSeconds
@@ -305,6 +334,9 @@ func normalizeRule(r Rule) Rule {
 }
 
 func validateRule(r Rule) error {
+	if r.ConfirmationSeconds < 60 || r.ConfirmationSeconds > 86400 || r.RecoverySeconds < 60 || r.RecoverySeconds > 86400 {
+		return errors.New("质量确认与恢复观察时间须为 60–86400 秒")
+	}
 	if !validNumber(r.MaxRateMultiplier) || r.MaxRateMultiplier > 1000000 ||
 		!validNumber(r.MinCacheRatio) || r.MinCacheRatio > 1 || !validNumber(r.MaxAverageFirstTokenMs) || r.MaxAverageFirstTokenMs > 3600000 ||
 		!validNumber(r.ExclusiveRateBelow) || r.ExclusiveRateBelow > 1000000 {
@@ -314,9 +346,15 @@ func validateRule(r Rule) error {
 		!validNumber(r.ExclusiveMaxAverageFirstTokenMs) || r.ExclusiveMaxAverageFirstTokenMs > 3600000 {
 		return errors.New("独占缓存下限须为 0–1，独占首字时间上限须为 0–3600000 毫秒；0 使用默认值")
 	}
-	if r.MinRequests < 1 || r.MinRequests > 20 || r.TriggerSamples < 1 || r.TriggerSamples > 100 || r.RecoverySamples < 1 || r.RecoverySamples > 100 ||
+	if r.MinRequests != QualityWindowRequests {
+		return fmt.Errorf("调用窗口固定为 %d 次；旧版调用样本数配置须为 1–20", QualityWindowRequests)
+	}
+	if r.MinInputTokens < 1 || r.MinInputTokens > MaxMinInputTokens {
+		return fmt.Errorf("最小输入上下文须为 1–%d token", MaxMinInputTokens)
+	}
+	if r.TriggerSamples < 1 || r.TriggerSamples > 100 || r.RecoverySamples < 1 || r.RecoverySamples > 100 ||
 		r.CooldownSeconds < 30 || r.CooldownSeconds > 86400 {
-		return errors.New("调用样本数须为 1–20，连续次数须为 1–100，恢复等待须为 30–86400 秒")
+		return errors.New("连续次数须为 1–100，恢复等待须为 30–86400 秒")
 	}
 	if r.Action != "pause" && r.Action != "deprioritize" {
 		return errors.New("动作必须为 pause 或 deprioritize")

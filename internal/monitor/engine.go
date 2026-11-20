@@ -21,54 +21,115 @@ type Store interface {
 
 type API interface {
 	Account(context.Context, int64) (adminapi.Account, error)
-	RecentUsage(context.Context, int64, time.Time) (adminapi.Window, error)
-	RecentUsageSince(context.Context, int64, time.Time, time.Time) (adminapi.Window, error)
+	RecentUsageSince(context.Context, int64, time.Time, time.Time, int64) (adminapi.Window, error)
 	Rates(context.Context) (map[int64]*adminapi.RateSnapshot, error)
+	ClearError(context.Context, int64) error
 	SetSchedulable(context.Context, int64, bool) error
 	SetPriority(context.Context, int64, int) error
 	Close()
 }
 
 type AccountStatus struct {
-	ID                     int64      `json:"id"`
-	Name                   string     `json:"name"`
-	Platform               string     `json:"platform"`
-	Type                   string     `json:"type"`
-	Group                  string     `json:"group"`
-	RateMode               string     `json:"rate_mode"`
-	FixedRate              *float64   `json:"fixed_rate"`
-	Status                 string     `json:"status"`
-	Schedulable            bool       `json:"schedulable"`
-	DesiredSchedulable     *bool      `json:"desired_schedulable"`
-	Priority               int        `json:"priority"`
-	AccountRate            *float64   `json:"account_rate"`
-	UpstreamRate           *float64   `json:"upstream_rate"`
-	EffectiveRate          *float64   `json:"effective_rate"`
-	Requests               int        `json:"requests"`
-	InputTokens            int64      `json:"input_tokens"`
-	CacheCreationTokens    int64      `json:"cache_creation_tokens"`
-	CacheReadTokens        int64      `json:"cache_read_tokens"`
-	CacheRatio             *float64   `json:"cache_ratio"`
-	Complete               bool       `json:"complete"`
-	AverageFirstTokenMs    *float64   `json:"average_first_token_ms"`
-	FirstTokenSamples      int        `json:"first_token_samples"`
-	FirstTokenLimitReached bool       `json:"first_token_limit_reached,omitempty"`
-	RecoveryAt             *time.Time `json:"recovery_at,omitempty"`
-	SampleKey              string     `json:"-"`
-	FirstTokenSampleKey    string     `json:"-"`
-	State                  string     `json:"state"`
-	ReadOK                 bool       `json:"read_ok"`
-	Availability           string     `json:"availability_reason,omitempty"`
-	Reason                 string     `json:"reason"`
-	Error                  string     `json:"error"`
-	UpdatedAt              time.Time  `json:"updated_at"`
+	ID                      int64          `json:"id"`
+	Name                    string         `json:"name"`
+	Platform                string         `json:"platform"`
+	Type                    string         `json:"type"`
+	Group                   string         `json:"group"`
+	RateMode                string         `json:"rate_mode"`
+	FixedRate               *float64       `json:"fixed_rate"`
+	Status                  string         `json:"status"`
+	Schedulable             bool           `json:"schedulable"`
+	DesiredSchedulable      *bool          `json:"desired_schedulable"`
+	Priority                int            `json:"priority"`
+	AccountRate             *float64       `json:"account_rate"`
+	UpstreamRate            *float64       `json:"upstream_rate"`
+	EffectiveRate           *float64       `json:"effective_rate"`
+	Requests                int            `json:"requests"`
+	MinInputTokens          int64          `json:"min_input_tokens"`
+	ExcludedSmallRequests   int            `json:"excluded_small_requests"`
+	ExcludedUnknownRequests int            `json:"excluded_unknown_requests"`
+	InputTokens             int64          `json:"input_tokens"`
+	CacheCreationTokens     int64          `json:"cache_creation_tokens"`
+	CacheReadTokens         int64          `json:"cache_read_tokens"`
+	CacheRatio              *float64       `json:"cache_ratio"`
+	Complete                bool           `json:"complete"`
+	AverageFirstTokenMs     *float64       `json:"average_first_token_ms"`
+	FirstTokenSamples       int            `json:"first_token_samples"`
+	FirstTokenLimitReached  bool           `json:"first_token_limit_reached,omitempty"`
+	RecoveryAt              *time.Time     `json:"recovery_at,omitempty"`
+	SampleKey               string         `json:"-"`
+	SampleEndKey            string         `json:"-"`
+	FirstTokenSampleKey     string         `json:"-"`
+	State                   string         `json:"state"`
+	StatusSince             *time.Time     `json:"status_since,omitempty"`
+	QualityBadWindows       int            `json:"quality_bad_windows"`
+	QualityGoodWindows      int            `json:"quality_good_windows"`
+	QualitySampling         *QualityStatus `json:"quality_sampling,omitempty"`
+	QualityScanLimitReached bool           `json:"quality_scan_limit_reached"`
+	FailureKind             string         `json:"failure_kind,omitempty"`
+	FailureCount            int            `json:"failure_count"`
+	TemporaryFailures       int            `json:"temporary_failures"`
+	RecoveryAttempts        int            `json:"recovery_attempts"`
+	RecoveryFailures        int            `json:"recovery_failures"`
+	LastFailureAt           *time.Time     `json:"last_failure_at,omitempty"`
+	LastRecoveryAttemptAt   *time.Time     `json:"last_recovery_attempt_at,omitempty"`
+	NextRetryAt             *time.Time     `json:"next_retry_at,omitempty"`
+	DegradationLevel        int            `json:"degradation_level"`
+	DegradedTo              string         `json:"degraded_to,omitempty"`
+	RecoveryTrial           bool           `json:"recovery_trial"`
+	RecoveryStartedAt       *time.Time     `json:"recovery_started_at,omitempty"`
+	RecoveryDeadline        *time.Time     `json:"recovery_deadline,omitempty"`
+	ErrorMetricsAvailable   bool           `json:"error_metrics_available"`
+	ErrorRequests           *int           `json:"error_requests,omitempty"`
+	ReadOK                  bool           `json:"read_ok"`
+	Availability            string         `json:"availability_reason,omitempty"`
+	Reason                  string         `json:"reason"`
+	Error                   string         `json:"error"`
+	UpdatedAt               time.Time      `json:"updated_at"`
+	quality                 *adminapi.QualityWindow
+}
+
+type QualityStatus struct {
+	Requests                int                          `json:"requests"`
+	FirstTokenSamples       int                          `json:"first_token_samples"`
+	CacheRatio              *float64                     `json:"cache_ratio"`
+	AverageFirstTokenMs     *float64                     `json:"average_first_token_ms"`
+	BadWindows              int                          `json:"bad_windows"`
+	GoodWindows             int                          `json:"good_windows"`
+	LastEvaluatedAt         *time.Time                   `json:"last_evaluated_at,omitempty"`
+	Reason                  string                       `json:"reason"`
+	MinInputTokens          int64                        `json:"min_input_tokens"`
+	ExcludedSmallRequests   int                          `json:"excluded_small_requests"`
+	ExcludedUnknownRequests int                          `json:"excluded_unknown_requests"`
+	History                 []QualityWindowHistory       `json:"history"`
+	Models                  []adminapi.QualityModelUsage `json:"models"`
+	WindowKnown             bool                         `json:"window_known"`
+}
+
+type QualityWindowHistory struct {
+	WindowStart             time.Time                    `json:"window_start"`
+	WindowEnd               time.Time                    `json:"window_end"`
+	RecordedAt              time.Time                    `json:"recorded_at"`
+	Requests                int                          `json:"requests"`
+	MinInputTokens          int64                        `json:"min_input_tokens"`
+	ExcludedSmallRequests   int                          `json:"excluded_small_requests"`
+	ExcludedUnknownRequests int                          `json:"excluded_unknown_requests"`
+	CacheRatio              *float64                     `json:"cache_ratio"`
+	AverageFirstTokenMs     *float64                     `json:"average_first_token_ms"`
+	FirstTokenSamples       int                          `json:"first_token_samples"`
+	Result                  string                       `json:"result"`
+	Reason                  string                       `json:"reason"`
+	Models                  []adminapi.QualityModelUsage `json:"models"`
 }
 
 func (row *AccountStatus) clearUsage() {
 	row.Requests, row.InputTokens, row.CacheCreationTokens, row.CacheReadTokens = 0, 0, 0, 0
+	row.MinInputTokens, row.ExcludedSmallRequests, row.ExcludedUnknownRequests = 0, 0, 0
 	row.CacheRatio, row.AverageFirstTokenMs = nil, nil
 	row.Complete, row.FirstTokenSamples, row.FirstTokenLimitReached = false, 0, false
-	row.SampleKey, row.FirstTokenSampleKey = "", ""
+	row.SampleKey, row.SampleEndKey, row.FirstTokenSampleKey = "", "", ""
+	row.quality, row.QualitySampling = nil, nil
+	row.QualityScanLimitReached = false
 }
 
 type Event struct {
@@ -95,29 +156,54 @@ type Status struct {
 }
 
 type ActionRecord struct {
-	AccountID           int64       `json:"account_id"`
-	AdminURL            string      `json:"admin_url"`
-	Executor            string      `json:"executor"`
-	Action              string      `json:"action"`
-	Phase               string      `json:"phase"`
-	OriginalPriority    int         `json:"original_priority"`
-	TargetPriority      int         `json:"target_priority"`
-	OriginalSchedulable bool        `json:"original_schedulable"`
-	OriginalStatus      string      `json:"original_status"`
-	AppliedAt           time.Time   `json:"applied_at"`
-	Policy              config.Rule `json:"policy"`
-	WindowMinutes       int         `json:"window_minutes"`
-	TargetSchedulable   bool        `json:"target_schedulable"`
-	Platform            string      `json:"platform,omitempty"`
-	Group               string      `json:"group,omitempty"`
-	PendingField        string      `json:"pending_field,omitempty"`
-	PendingPriority     int         `json:"pending_priority,omitempty"`
-	PendingSchedulable  bool        `json:"pending_schedulable"`
-	HoldUntil           *time.Time  `json:"hold_until,omitempty"`
-	LastBadSample       string      `json:"last_bad_sample,omitempty"`
-	SampleSince         *time.Time  `json:"sample_since,omitempty"`
-	Reason              string      `json:"reason,omitempty"`
-	LastState           string      `json:"last_state,omitempty"`
+	AccountID           int64                         `json:"account_id"`
+	AdminURL            string                        `json:"admin_url"`
+	Executor            string                        `json:"executor"`
+	Action              string                        `json:"action"`
+	Phase               string                        `json:"phase"`
+	OriginalPriority    int                           `json:"original_priority"`
+	TargetPriority      int                           `json:"target_priority"`
+	OriginalSchedulable bool                          `json:"original_schedulable"`
+	OriginalStatus      string                        `json:"original_status"`
+	AppliedAt           time.Time                     `json:"applied_at"`
+	Policy              config.Rule                   `json:"policy"`
+	WindowMinutes       int                           `json:"window_minutes"`
+	TargetSchedulable   bool                          `json:"target_schedulable"`
+	Platform            string                        `json:"platform,omitempty"`
+	Group               string                        `json:"group,omitempty"`
+	PendingField        string                        `json:"pending_field,omitempty"`
+	PendingPriority     int                           `json:"pending_priority,omitempty"`
+	PendingSchedulable  bool                          `json:"pending_schedulable"`
+	HoldUntil           *time.Time                    `json:"hold_until,omitempty"`
+	LastBadSample       string                        `json:"last_bad_sample,omitempty"`
+	LastQualityWindow   string                        `json:"last_quality_window,omitempty"`
+	QualityTracks       map[string]legacyQualityTrack `json:"quality_tracks,omitempty"`
+	QualityScope        string                        `json:"quality_scope,omitempty"`
+	QualityLegacyAnchor string                        `json:"quality_legacy_anchor,omitempty"`
+	QualityHistoryRetry *qualityHistoryRetry          `json:"quality_history_retry,omitempty"`
+	QualityBadSince     *time.Time                    `json:"quality_bad_since,omitempty"`
+	QualityEvaluatedAt  *time.Time                    `json:"quality_evaluated_at,omitempty"`
+	QualityReason       string                        `json:"quality_reason,omitempty"`
+	FailureKind         string                        `json:"failure_kind,omitempty"`
+	FailureCount        int                           `json:"failure_count"`
+	RecoveryFailures    int                           `json:"recovery_failures"`
+	LastFailureAt       *time.Time                    `json:"last_failure_at,omitempty"`
+	AccountFault        bool                          `json:"account_fault"`
+	LastTemporaryState  string                        `json:"last_temporary_state,omitempty"`
+	RecoveryStartedAt   *time.Time                    `json:"recovery_started_at,omitempty"`
+	RecoveryDeadline    *time.Time                    `json:"recovery_deadline,omitempty"`
+	BadWindows          int                           `json:"bad_windows"`
+	GoodWindows         int                           `json:"good_windows"`
+	DegradationLevel    int                           `json:"degradation_level"`
+	RecoveryTrial       bool                          `json:"recovery_trial"`
+	TemporaryFailures   int                           `json:"temporary_failures"`
+	RecoveryAttempts    int                           `json:"recovery_attempts"`
+	LastRecoveryAttempt time.Time                     `json:"last_recovery_attempt,omitempty"`
+	NextRetryAt         *time.Time                    `json:"next_retry_at,omitempty"`
+	StatusSince         time.Time                     `json:"status_since,omitempty"`
+	SampleSince         *time.Time                    `json:"sample_since,omitempty"`
+	Reason              string                        `json:"reason,omitempty"`
+	LastState           string                        `json:"last_state,omitempty"`
 }
 
 type Ledger struct {
@@ -125,8 +211,6 @@ type Ledger struct {
 	Events        []Event                  `json:"events"`
 	SamplingSince time.Time                `json:"sampling_since,omitempty"`
 }
-
-type counter struct{ bad, good int }
 
 type Engine struct {
 	mu           sync.RWMutex
@@ -137,7 +221,6 @@ type Engine struct {
 	cycleCancel  context.CancelFunc
 	wake         chan struct{}
 	status       Status
-	counters     map[int64]counter
 	pendingCount int
 	newAPI       func(config.Config) API
 	clock        func() time.Time
@@ -146,7 +229,7 @@ type Engine struct {
 
 func New(version, hostname string) *Engine {
 	return &Engine{
-		cfg: config.Defaults(), wake: make(chan struct{}, 1), counters: map[int64]counter{},
+		cfg: config.Defaults(), wake: make(chan struct{}, 1),
 		status: Status{Version: version, Hostname: hostname, Mode: "unconfigured",
 			Accounts: []AccountStatus{}, Events: []Event{}},
 		clock: time.Now,
@@ -208,17 +291,23 @@ func (e *Engine) Apply(c config.Config) error {
 		// An explicit off/on starts a new monitoring session. Keep unresolved
 		// owned settings recoverable, but release last session's manual accounts
 		// so their current host values become the next session's baseline.
-		for key, record := range ledger.Records {
-			if record.Phase == "manual_change" {
-				if e.cfg.AdminURL == c.AdminURL && e.cfg.ExecutorHostname == c.ExecutorHostname {
-					delete(ledger.Records, key)
+		// A process restart loads the durable session; only an explicit off/on
+		// in this process starts a new one.
+		resumeSession := e.cfg.AdminURL == "" && !ledger.SamplingSince.IsZero()
+		if !resumeSession {
+			for key, record := range ledger.Records {
+				if record.Phase == "manual_change" {
+					if e.cfg.AdminURL == c.AdminURL && e.cfg.ExecutorHostname == c.ExecutorHostname {
+						delete(ledger.Records, key)
+					}
+					continue
 				}
-				continue
+				record.HoldUntil, record.SampleSince = nil, nil
+				record.LastBadSample, record.Reason, record.LastState = "", "", ""
+				resetHealth(record)
 			}
-			record.HoldUntil, record.SampleSince = nil, nil
-			record.LastBadSample, record.Reason, record.LastState = "", "", ""
+			ledger.SamplingSince = e.clock().UTC()
 		}
-		ledger.SamplingSince = e.clock().UTC()
 		if err := save(ctx, e.store, ledger); err != nil {
 			return fmt.Errorf("无法重置监控采样：%w", err)
 		}
@@ -230,11 +319,11 @@ func (e *Engine) Apply(c config.Config) error {
 		for i := range e.status.Accounts {
 			row := &e.status.Accounts[i]
 			row.clearUsage()
+			clearHealthDetails(row)
 			row.State, row.Reason, row.RecoveryAt, row.Availability, row.Error = "observing", "", nil, "", ""
 		}
 	}
 	e.cfg, e.seq = c, e.seq+1
-	e.counters = map[int64]counter{}
 	select {
 	case e.wake <- struct{}{}:
 	default:
@@ -417,7 +506,7 @@ func (e *Engine) Cycle(parent context.Context, now time.Time) {
 		}
 	}
 	items := []*managedAccount{}
-	unknownSelected := false
+	unknownPlatforms := map[string]bool{}
 	for _, id := range ids {
 		if ctx.Err() != nil {
 			return
@@ -429,11 +518,17 @@ func (e *Engine) Cycle(parent context.Context, now time.Time) {
 		row := &item.row
 		items = append(items, item)
 		if err != nil {
-			e.mu.Lock()
-			delete(e.counters, id)
-			e.mu.Unlock()
 			row.Error = err.Error()
-			unknownSelected = unknownSelected || selected[id]
+			if selected[id] && groupRank(setting.Group) < len(callGroups) {
+				platform := setting.Platform
+				if record := ledger.Records[strconv.FormatInt(id, 10)]; record != nil {
+					platform = record.Platform
+				}
+				if platform == "" {
+					platform = "*"
+				}
+				unknownPlatforms[platform] = true
+			}
 			continue
 		}
 		item.account, item.readOK = a, true
@@ -478,37 +573,99 @@ func (e *Engine) Cycle(parent context.Context, now time.Time) {
 		}
 	}
 	e.mu.Unlock()
+	// Clear always-on temporary host state before potentially long usage scans.
+	if executor && ledgerOK && c.AutomationEnabled && ctx.Err() == nil {
+		always := []*managedAccount{}
+		for _, item := range items {
+			if item.setting.Group == "always_on" {
+				always = append(always, item)
+			}
+		}
+		if len(always) > 0 {
+			if err := e.schedule(ctx, api, store, ledger, c, always, unknownPlatforms, now); err != nil {
+				s.Error = joinError(s.Error, err.Error())
+				ledgerOK = false
+			}
+			for _, item := range always {
+				item.eligible, item.candidate, item.schedulable, item.restoring, item.managed = false, false, false, false, false
+			}
+		}
+	}
 	for _, item := range items {
 		if !s.SamplingActive || !item.readOK || !item.selected || item.account.Type != "apikey" {
 			continue
 		}
 		row := &item.row
 		since := ledger.SamplingSince
-		if record := ledger.Records[strconv.FormatInt(item.account.ID, 10)]; record != nil && record.SampleSince != nil {
+		record := ledger.Records[strconv.FormatInt(item.account.ID, 10)]
+		rule := config.NormalizeRule(c.GroupRule(item.account.Platform, item.setting.Group))
+		if record != nil && record.SampleSince != nil {
 			if since.IsZero() || record.SampleSince.After(since) {
 				since = *record.SampleSince
 			}
 		}
-		w, readErr := api.RecentUsageSince(ctx, item.account.ID, since, now)
+		policyChanged := record != nil && (record.Group != item.setting.Group || record.Platform != item.account.Platform ||
+			config.NormalizeRule(record.Policy) != rule)
+		if policyChanged {
+			since = now // A changed policy starts a fresh window; retain session history.
+		}
+		if executor && ledgerOK {
+			item.history = readQualityHistory(ctx, store, c, row, ledger.SamplingSince)
+			if record != nil && !policyChanged && item.history != nil {
+				item.priorQualityWindows, item.priorQualityPending = retryPriorQualityHistory(ctx, api, row, record, rule, item.history)
+			}
+		}
+		w, readErr := api.RecentUsageSince(ctx, item.account.ID, since, now, rule.MinInputTokens)
 		row.Requests, row.InputTokens, row.CacheCreationTokens, row.CacheReadTokens =
 			w.Requests, w.InputTokens, w.CacheCreationTokens, w.CacheReadTokens
 		if row.AccountRate == nil && w.AccountRate != nil {
 			row.AccountRate = w.AccountRate
 		}
 		row.Complete, row.CacheRatio = w.Complete, w.Ratio()
+		row.MinInputTokens, row.ExcludedSmallRequests, row.ExcludedUnknownRequests =
+			w.MinInputTokens, w.ExcludedSmallRequests, w.ExcludedUnknownRequests
 		row.AverageFirstTokenMs, row.FirstTokenSamples = w.AverageFirstTokenMs, w.FirstTokenSamples
 		row.FirstTokenLimitReached = w.FirstTokenLimitReached
-		row.SampleKey, row.FirstTokenSampleKey = w.SampleKey, w.FirstTokenSampleKey
+		row.SampleKey, row.SampleEndKey, row.FirstTokenSampleKey = w.SampleKey, w.SampleEndKey, w.FirstTokenSampleKey
+		if readErr == nil && item.history != nil {
+			anchor := latestSample(item.history.LastSample, legacyQualityAnchor(record))
+			if record != nil && record.QualityHistoryRetry != nil {
+				anchor = latestSample(anchor, record.QualityHistoryRetry.Through)
+			}
+			w.SealQuality(since, anchor)
+			if w.QualityCurrent != nil && !w.QualityCurrent.WindowKnown && record != nil &&
+				record.QualityScope == accountQualityScope && record.LastQualityWindow != "" {
+				// A failed history write can leave its cursor behind the scan cap.
+				// The actions ledger still identifies a safe window boundary.
+				w.SealQuality(since, record.LastQualityWindow)
+				if w.QualityCurrent.WindowKnown {
+					needed := qualityHistoryLimit - len(w.QualityWindows)
+					predecessors := w.QualityPredecessors(since, record.LastQualityWindow, needed)
+					item.priorQualityWindows = append(item.priorQualityWindows, predecessors...)
+					if len(predecessors) < needed {
+						row.Error = joinError(row.Error, "采集上限内无法补齐先前质量窗口历史")
+					}
+				}
+			}
+			row.quality, item.qualityWindows = w.QualityCurrent, w.QualityWindows
+		}
+		row.QualityScanLimitReached = w.QualityScanLimitReached
 		if readErr != nil {
 			row.Error = joinError(row.Error, readErr.Error())
 		}
 	}
 	if executor && ledgerOK && ctx.Err() == nil {
-		if err := e.schedule(ctx, api, store, ledger, c, items, unknownSelected, now); err != nil {
+		if err := e.schedule(ctx, api, store, ledger, c, items, unknownPlatforms, now); err != nil {
 			s.Error = joinError(s.Error, err.Error())
+			ledgerOK = false // Never advance diagnostic cursors past undurable decisions.
 		}
 	}
 	for _, item := range items {
+		if s.SamplingActive && executor && ledgerOK && item.readOK && item.selected && item.account.Type == "apikey" {
+			rule := config.NormalizeRule(c.GroupRule(item.account.Platform, item.setting.Group))
+			writeQualityHistory(ctx, store, item, rule, now)
+			fillQualityStatus(&item.row, ledger.Records[strconv.FormatInt(item.row.ID, 10)], item.history)
+		}
 		s.Accounts = append(s.Accounts, item.row)
 	}
 	if len(c.AccountIDs) == 0 && len(ledger.Records) == 0 {

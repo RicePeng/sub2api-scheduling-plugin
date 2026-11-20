@@ -24,6 +24,11 @@ type managedAccount struct {
 	record                                *ActionRecord
 	priority                              int
 	schedulable                           bool
+	candidate                             bool
+	history                               *accountQualityHistory
+	qualityWindows                        []adminapi.QualityWindow
+	priorQualityWindows                   []adminapi.QualityWindow
+	priorQualityPending                   bool
 }
 
 func groupRank(group string) int {
@@ -35,14 +40,15 @@ func groupRank(group string) int {
 	return len(callGroups)
 }
 
-// schedule closes non-selected pools before opening the winning pool. Priority
-// alone cannot enforce strict failover, so later pools are explicitly paused.
+// A recovery candidate keeps its configured priority. The stable group stays
+// open until the candidate has proved healthy using fresh traffic.
 func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Ledger, c config.Config,
-	items []*managedAccount, unknownSelected bool, now time.Time) error {
+	items []*managedAccount, unknownPlatforms map[string]bool, now time.Time) error {
 	winners := map[string]int{}
+	candidates := map[string]*managedAccount{}
 	for _, item := range items {
 		a, row := item.account, &item.row
-		key := strconv.FormatInt(row.ID, 10)
+		key := strconv.FormatInt(a.ID, 10)
 		r := ledger.Records[key]
 		item.record = r
 		if !item.readOK {
@@ -50,14 +56,13 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 		}
 		if a.Type != "apikey" {
 			if r != nil {
-				row.Error = "此非 API Key 账号存在旧管理记录；请在宿主人工核对并恢复，插件不会写入此账号"
+				row.Error = "非 API Key 账号有旧记录，请人工核对，插件不会写入"
 			}
 			continue
 		}
 		if r != nil {
 			if r.Action != "schedule" {
 				item.restoring = true
-				// Migrate the old single-action ledger to the same guarded writer.
 				if r.Phase == "pending_restore" && matchesOriginal(a, r) {
 					delete(ledger.Records, key)
 					item.record = nil
@@ -76,19 +81,14 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			}
 			if r.Phase == "manual_change" {
 				if c.AutomationEnabled {
-					row.State, row.Reason = "manual_change", "检测到人工操作；已进入手动操作组，插件保留当前调度与优先级，不再自动修改"
+					row.State, row.Reason = "manual_change", "检测到人工操作，保留当前调度与优先级，不再自动修改"
 					if !a.Schedulable && r.TargetSchedulable {
-						row.Reason = "运行监控后检测到宿主将账号设为不可调度；已进入手动操作组，保持调度关闭"
+						row.Reason = "运行监控后检测到宿主将账号设为不可调度；保持调度关闭"
 					} else if a.Schedulable && !r.TargetSchedulable {
-						row.Reason = "运行监控后检测到人工开启调度；已进入手动操作组，保持调度开启"
+						row.Reason = "运行监控后检测到人工开启调度；保持调度开启"
 					}
-				}
-				// A manually changed account can still be serving traffic. It
-				// must continue to block later groups without being overwritten.
-				if c.AutomationEnabled && item.selected && a.Schedulable && a.Active(now) && item.setting.Group != "temporary" {
-					rank := groupRank(item.setting.Group)
-					if winner, ok := winners[a.Platform]; !ok || rank < winner {
-						winners[a.Platform] = rank
+					if item.selected && a.Schedulable && a.Active(now) && groupRank(item.setting.Group) < len(callGroups) {
+						selectWinner(winners, a.Platform, groupRank(item.setting.Group))
 					}
 				}
 				if !item.selected {
@@ -106,20 +106,21 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			}
 			continue
 		}
-		// Capture the initial scheduling settings before applying group policy.
-		// Host health remains a gate; the initial scheduling switch is restored
-		// when management stops, rather than excluding the account forever.
+		rule := config.NormalizeRule(c.GroupRule(a.Platform, item.setting.Group))
 		if r == nil {
 			r = &ActionRecord{AccountID: a.ID, AdminURL: c.AdminURL, Executor: c.ExecutorHostname, Action: "schedule", Phase: "active",
 				OriginalPriority: a.Priority, TargetPriority: a.Priority, OriginalSchedulable: a.Schedulable, TargetSchedulable: a.Schedulable,
-				OriginalStatus: a.Status, Platform: a.Platform, Group: item.setting.Group, AppliedAt: now}
+				OriginalStatus: a.Status, Platform: a.Platform, Group: item.setting.Group, Policy: rule, AppliedAt: now, StatusSince: now}
 			ledger.Records[key], item.record = r, r
 		}
-		hostAvailable := a.Active(now)
-		rule := c.GroupRule(a.Platform, item.setting.Group)
+		migrateQualityWindow(r)
+		if retry := r.QualityHistoryRetry; retry != nil && item.history != nil &&
+			!sampleAfter(retry.Through, item.history.LastSample) && item.history.LastSample != "" {
+			r.QualityHistoryRetry = nil
+		}
 		if r.Group != item.setting.Group || r.Platform != a.Platform || r.Policy != rule {
-			r.HoldUntil, r.LastBadSample, r.Reason = nil, "", ""
-			e.counters[a.ID] = counter{}
+			resetHealth(r)
+			r.SampleSince = &now
 		}
 		r.Group, r.Platform, r.Policy = item.setting.Group, a.Platform, rule
 		item.priority = c.GroupPriority(a.Platform, item.setting.Group)
@@ -133,105 +134,207 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			item.managed = true
 			continue
 		}
-		if !hostAvailable {
-			reason := row.Availability
-			if reason == "" {
-				reason = "宿主账号当前不可调用"
-			}
-			row.State, row.Reason = "unavailable", reason
+		if a.Status == "error" {
+			markAccountFault(item, a, now)
+			continue
+		}
+		if a.Status != "active" || (a.ExpiresAt != nil && *a.ExpiresAt <= now.Unix()) {
+			row.State, row.Reason = "unavailable", row.Availability
 			item.managed = true
 			continue
 		}
-		if row.EffectiveRate == nil {
-			row.State, row.Reason = "needs_rate", "没有有效倍率，请设置固定倍率"
-			if row.RateMode == "waiting" {
-				row.Reason = "等待获取上游倍率；也可设置固定倍率后参与调用"
+		if r.AccountFault {
+			r.AccountFault = false
+			r.HoldUntil = &now
+			row.clearUsage()
+			logEvent(ledger, a.ID, a.Name, "account_repaired", "宿主账号已由人工修复，排队验证恢复", now)
+		}
+		// Temporary host flags still gate requests at the host. A failed clear
+		// must not turn off the always-on scheduling switch as well.
+		if item.setting.Group == "always_on" {
+			item.schedulable = true
+		}
+		temp := a.TemporaryUnavailableReason(now)
+		newTemporaryState := temp != "" && temp != r.LastTemporaryState
+		if temp != "" && (r.FailureKind != "temporary" || r.RecoveryStartedAt != nil || newTemporaryState) {
+			recordFailure(r, "temporary", temp, now, rule)
+			r.LastTemporaryState = temp
+			if item.setting.Group == "always_on" {
+				r.HoldUntil = &now
 			}
-			// Keep an account with unknown rate closed. Previously it could
-			// retain an open scheduler state while later groups waited for it,
-			// leaving no callable pool.
-			item.schedulable = false
-			item.managed = true
-			continue
 		}
 		if r.HoldUntil != nil && now.Before(*r.HoldUntil) {
 			row.State, row.Reason, row.RecoveryAt = "paused", r.Reason, r.HoldUntil
+			if r.FailureKind == "temporary" {
+				row.State = "temporary_retry"
+			}
 			item.managed = true
 			continue
 		}
-		bad, known, reason, sample := false, false, "等待本次启用后的调用样本", ""
-		if r.HoldUntil != nil {
-			r.HoldUntil = nil
-			r.SampleSince = &now
-			r.LastBadSample = ""
-			e.counters[a.ID] = counter{}
-			row.clearUsage()
-			reason = "异常等待期已到，正在重新采样"
-			logEvent(ledger, a.ID, a.Name, "restored", reason, now)
-		} else {
-			bad, known, reason, sample = evaluate(rule, *row)
-			if !bad && row.Requests == 0 {
-				known = false
-				reason = "等待本次启用后的调用样本"
+		if item.setting.Group == "always_on" {
+			// This group is independent of the four ordinary failover groups.
+			if temp != "" {
+				if err := e.clearTemporary(ctx, api, store, ledger, item, now); err != nil {
+					if !r.AccountFault {
+						retryFailed(r, err.Error(), now, rule)
+						row.State, row.Reason, row.RecoveryAt = "temporary_retry", r.Reason, r.HoldUntil
+					}
+					row.Error = joinError(row.Error, err.Error())
+					item.managed = true
+					continue
+				}
+				a = item.account
+				r.HoldUntil, r.LastTemporaryState = nil, ""
+				startTrial(item, ledger.SamplingSince, now, rule)
+			} else if r.HoldUntil != nil {
+				r.HoldUntil = nil
+				startTrial(item, ledger.SamplingSince, now, rule)
 			}
-		}
-		count := e.counters[a.ID]
-		if bad && known && sample != r.LastBadSample {
-			count.bad++
-		} else {
-			count.bad = 0
-		}
-		e.counters[a.ID] = count
-		if bad && known && count.bad >= rule.TriggerSamples {
-			until := now.Add(time.Duration(rule.CooldownSeconds) * time.Second)
-			r.HoldUntil, r.LastBadSample, r.Reason = &until, sample, reason
-			row.State, row.Reason, row.RecoveryAt = "paused", reason, &until
-			logEvent(ledger, a.ID, a.Name, "pause", reason, now)
+			if r.RecoveryTrial && r.RecoveryStartedAt != nil && now.Sub(*r.RecoveryStartedAt) >= time.Duration(recoverySeconds(rule))*time.Second && row.Complete && row.Requests == config.QualityWindowRequests {
+				finishRecovery(r)
+			}
+			item.eligible, item.schedulable = true, true
+			row.State, row.Reason = "ready", "常开组持续开启；与普通调用组独立调度"
+			if r.RecoveryTrial {
+				row.State, row.Reason = "recovering", "常开组已清理临时状态，保持开启并等待新的成功调用确认稳定"
+			}
 			continue
 		}
-		item.eligible = true
-		row.State, row.Reason = "ready", "组内账号可参与调用"
-		if bad && known && sample != r.LastBadSample {
-			row.State, row.Reason = "pending", reason
-		} else if !known {
-			row.State, row.Reason = "sampling", reason
+		// Price is a scheduling policy, not evidence of a broken account.
+		if row.EffectiveRate == nil || (rule.MaxRateMultiplier > 0 && *row.EffectiveRate > rule.MaxRateMultiplier) {
+			row.State, row.Reason = "needs_rate", "没有有效倍率，请设置倍率"
+			if row.EffectiveRate != nil {
+				row.State, row.Reason = "policy_wait", fmt.Sprintf("采用倍率 %.4g× 超过本组上限 %.4g×，等待倍率恢复", *row.EffectiveRate, rule.MaxRateMultiplier)
+			}
+			item.managed = true
+			continue
 		}
-		rank := groupRank(item.setting.Group)
-		if winner, ok := winners[a.Platform]; !ok || rank < winner {
-			winners[a.Platform] = rank
+		if r.HoldUntil != nil || r.RecoveryTrial || r.FailureKind != "" {
+			r.RecoveryTrial = true
+			item.candidate = true
+			row.State, row.Reason = "recovery_wait", "已到恢复时间，等待前序组恢复尝试；使用原组优先级"
+			// A running trial cannot reuse observations from before it opened.
+			if r.RecoveryStartedAt != nil {
+				failed, healthy := evaluateQuality(r, item, rule, now, true)
+				if failed {
+					recordFailure(r, "quality", row.Reason, now, rule)
+					row.State, row.Reason, row.RecoveryAt = "paused", r.Reason, r.HoldUntil
+					item.candidate = false
+					continue
+				}
+				if healthy && now.Sub(*r.RecoveryStartedAt) >= time.Duration(recoverySeconds(rule))*time.Second {
+					finishRecovery(r)
+					item.candidate = false
+					row.State, row.Reason = "ready", "恢复观察通过，已回到原组正常调度"
+					logEvent(ledger, a.ID, a.Name, "recovered", row.Reason, now)
+				} else if r.RecoveryDeadline != nil && !now.Before(*r.RecoveryDeadline) {
+					// No traffic or incomplete samples are not additional account faults.
+					until := now.Add(retryBackoff(rule.CooldownSeconds, r.DegradationLevel))
+					r.HoldUntil, r.RecoveryTrial, r.RecoveryStartedAt, r.RecoveryDeadline = &until, false, nil, nil
+					r.Reason = "恢复观察期内有效健康样本不足，延后再次尝试；未增加故障次数"
+					row.State, row.Reason, row.RecoveryAt = "paused", r.Reason, &until
+					item.candidate = false
+					continue
+				}
+			}
+		} else {
+			start := ledger.SamplingSince
+			if r.SampleSince != nil {
+				start = *r.SampleSince
+			}
+			if !now.Before(start.Add(time.Duration(confirmationSeconds(rule)) * time.Second)) {
+				failed, _ := evaluateQuality(r, item, rule, now, false)
+				if failed {
+					recordFailure(r, "quality", row.Reason, now, rule)
+					row.State, row.Reason, row.RecoveryAt = "paused", r.Reason, r.HoldUntil
+					item.managed = true
+					continue
+				}
+			} else {
+				// Persist the boundary even if saving diagnostic history fails.
+				for _, window := range item.qualityWindows {
+					if freshQualityWindow(window, latestSample(r.QualityLegacyAnchor, r.LastQualityWindow)) {
+						r.LastQualityWindow = window.LastSample
+					}
+				}
+			}
+			row.State, row.Reason = "sampling", fmt.Sprintf("等待账号 %d 次有效调用组成完整窗口", config.QualityWindowRequests)
+			if r.BadWindows > 0 {
+				row.State, row.Reason = "pending", fmt.Sprintf("质量异常待确认：%d / %d 个独立窗口；%s", r.BadWindows, triggerWindows(rule), r.QualityReason)
+			} else if r.GoodWindows > 0 {
+				row.State, row.Reason = "ready", "质量窗口健康，可参与本组调度"
+			}
+		}
+		item.eligible = true
+		if item.candidate {
+			old := candidates[a.Platform]
+			if old == nil || (r.RecoveryStartedAt != nil && old.record.RecoveryStartedAt == nil) || (r.RecoveryStartedAt == nil && old.record.RecoveryStartedAt == nil && (groupRank(item.setting.Group) < groupRank(old.setting.Group) || (item.setting.Group == old.setting.Group && a.ID < old.account.ID))) {
+				candidates[a.Platform] = item
+			}
+		} else {
+			selectWinner(winners, a.Platform, groupRank(item.setting.Group))
 		}
 	}
-	// Excellent group's optional low-rate rule selects one account per platform.
 	exclusive := map[string]*managedAccount{}
 	for _, item := range items {
-		if !item.eligible || item.setting.Group != "excellent" {
+		if !item.eligible || item.candidate || item.setting.Group != "excellent" {
 			continue
 		}
 		rule := c.GroupRule(item.account.Platform, "excellent")
-		threshold := rule.ExclusiveRateBelow
-		if threshold <= 0 || item.row.EffectiveRate == nil || *item.row.EffectiveRate >= threshold {
+		if rule.ExclusiveRateBelow <= 0 || item.row.EffectiveRate == nil || *item.row.EffectiveRate >= rule.ExclusiveRateBelow {
 			continue
 		}
 		if reason := exclusiveExitReason(rule, item.row); reason != "" {
-			// Leaving exclusivity does not pause the account. It remains in the
-			// ordinary group pool unless that group's own rules stop it.
 			item.row.Reason = joinError(item.row.Reason, reason)
 			continue
 		}
-		previous := exclusive[item.account.Platform]
-		if previous == nil || *item.row.EffectiveRate < *previous.row.EffectiveRate || (*item.row.EffectiveRate == *previous.row.EffectiveRate && item.row.ID < previous.row.ID) {
+		old := exclusive[item.account.Platform]
+		if old == nil || *item.row.EffectiveRate < *old.row.EffectiveRate || (*item.row.EffectiveRate == *old.row.EffectiveRate && item.row.ID < old.row.ID) {
 			exclusive[item.account.Platform] = item
 		}
 	}
 	for _, item := range items {
-		if !item.eligible {
+		if !item.eligible || item.setting.Group == "always_on" {
 			continue
 		}
-		if unknownSelected {
-			item.row.State, item.row.Reason = "group_wait", "有账号信息读取失败，暂不开放新的调用组"
+		if unknownPlatforms[item.account.Platform] || unknownPlatforms["*"] {
+			item.schedulable = item.account.Schedulable
+			item.row.State, item.row.Reason = "group_wait", "本平台有账号信息读取失败，保留现有调度，暂不开放新的调用组"
 			continue
 		}
-		if groupRank(item.setting.Group) != winners[item.account.Platform] {
+		winner, hasWinner := winners[item.account.Platform]
+		if item.candidate {
+			if candidates[item.account.Platform] != item || (hasWinner && groupRank(item.setting.Group) > winner) {
+				continue
+			}
+			// Configuration may deliberately override priorities. Do not silently make
+			// a recovery candidate equal to (or lower than) a later fallback group.
+			if hasWinner && groupRank(item.setting.Group) < winner && item.priority >= c.GroupPriority(item.account.Platform, callGroups[winner]) {
+				item.row.Reason = "原组优先级未高于后备组，请停止监控后调整组优先级再恢复"
+				continue
+			}
+			if item.record.RecoveryStartedAt == nil {
+				if item.account.TemporaryUnavailableReason(now) != "" {
+					if err := e.clearTemporary(ctx, api, store, ledger, item, now); err != nil {
+						if !item.record.AccountFault {
+							retryFailed(item.record, err.Error(), now, item.record.Policy)
+							item.row.State, item.row.Reason, item.row.RecoveryAt = "temporary_retry", item.record.Reason, item.record.HoldUntil
+						}
+						item.row.Error = joinError(item.row.Error, err.Error())
+						continue
+					}
+				} else {
+					item.record.RecoveryAttempts++
+					item.record.LastRecoveryAttempt = now
+				}
+				startTrial(item, ledger.SamplingSince, now, item.record.Policy)
+				logEvent(ledger, item.row.ID, item.row.Name, "recovery_trial", "开始按原组优先级恢复试运行，后备组保持开启", now)
+			}
+			item.schedulable = true
+			item.row.State, item.row.Reason = "recovering", fmt.Sprintf("原组优先级 %d 恢复试运行；健康窗口 %d / %d；后备组保持开启", item.priority, item.record.GoodWindows, recoveryWindows(item.record.Policy))
+			continue
+		}
+		if !hasWinner || groupRank(item.setting.Group) != winner {
 			item.row.State, item.row.Reason = "group_wait", "等待前序调用组全部不可用"
 			continue
 		}
@@ -241,57 +344,263 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 		}
 		item.schedulable = true
 	}
-	// Persist ownership, holds and decisions before the first mutation.
+	for _, item := range items {
+		updateRecordStatus(ledger, item, now)
+	}
 	if err := save(ctx, store, ledger); err != nil {
 		return err
 	}
 	ordered := append([]*managedAccount{}, items...)
 	sort.SliceStable(ordered, func(i, j int) bool { return !ordered[i].schedulable && ordered[j].schedulable })
+	blockedOpens := map[string]bool{}
 	for _, item := range ordered {
 		r := item.record
 		if !item.readOK || item.account.Type != "apikey" || r == nil || r.Phase == "manual_change" {
 			continue
 		}
+		if !item.restoring && item.setting.Group != "always_on" && item.schedulable &&
+			!item.account.Schedulable && blockedOpens[item.account.Platform] {
+			item.row.State, item.row.Reason = "group_wait", "前序账号关闭尚未确认，等待下次核对后再开放调度"
+			updateRecordStatus(ledger, item, now)
+			continue
+		}
 		if err := e.syncSchedule(ctx, api, store, ledger, item); err != nil {
 			item.row.Error = joinError(item.row.Error, err.Error())
-			// A failed write for one account must not prevent safe closure or
-			// priority updates for the rest of the platform.
+			if !item.schedulable && !item.restoring && item.setting.Group != "always_on" &&
+				(item.account.Schedulable || r.TargetSchedulable || r.PendingField == "schedulable") {
+				blockedOpens[item.account.Platform] = true
+			}
+			updateRecordStatus(ledger, item, now)
 			continue
 		}
 		if item.restoring {
 			delete(ledger.Records, strconv.FormatInt(item.row.ID, 10))
 			logEvent(ledger, item.row.ID, item.row.Name, "restored", "已恢复插件接管前的优先级和调度状态", now)
 			item.row.State, item.row.Reason = "observing", "原设置已恢复"
-		} else if r.LastState != item.row.State {
-			logEvent(ledger, item.row.ID, item.row.Name, item.row.State, item.row.Reason, now)
-			r.LastState = item.row.State
+			clearHealthDetails(&item.row)
+		} else {
+			updateRecordStatus(ledger, item, now)
 		}
 		if err := save(ctx, store, ledger); err != nil {
 			return err
 		}
 	}
+	return save(ctx, store, ledger)
+}
+
+func markAccountFault(item *managedAccount, a adminapi.Account, now time.Time) {
+	r := item.record
+	if !r.AccountFault {
+		recordFailure(r, "account", "宿主账号 error，需要人工处理凭证或账号配置", now, r.Policy)
+	}
+	r.AccountFault, r.HoldUntil = true, nil
+	item.account, item.schedulable, item.managed = a, false, true
+	item.row.Status, item.row.Priority, item.row.Schedulable = a.Status, a.Priority, a.Schedulable
+	item.row.Availability = a.AvailabilityReason(now)
+	item.row.State, item.row.Reason = "account_error", "宿主账号 error，需要人工处理凭证或账号配置；插件不会自动清除此状态"
+}
+
+func selectWinner(winners map[string]int, platform string, rank int) {
+	if old, ok := winners[platform]; !ok || rank < old {
+		winners[platform] = rank
+	}
+}
+func triggerWindows(r config.Rule) int  { return max(2, r.TriggerSamples) }
+func recoveryWindows(r config.Rule) int { return max(2, r.RecoverySamples) }
+func confirmationSeconds(r config.Rule) int {
+	if r.ConfirmationSeconds < 60 {
+		return 180
+	}
+	return r.ConfirmationSeconds
+}
+func recoverySeconds(r config.Rule) int {
+	if r.RecoverySeconds < 60 {
+		return 300
+	}
+	return r.RecoverySeconds
+}
+func retryBackoff(baseSeconds, level int) time.Duration {
+	delay := time.Duration(max(30, baseSeconds)) * time.Second
+	for i := 1; i < level && delay < 24*time.Hour; i++ {
+		delay *= 2
+	}
+	if delay > 24*time.Hour {
+		return 24 * time.Hour
+	}
+	return delay
+}
+func recordFailure(r *ActionRecord, kind, reason string, now time.Time, rule config.Rule) {
+	if r.RecoveryStartedAt != nil {
+		r.RecoveryFailures++
+	}
+	r.FailureCount++
+	if kind == "temporary" {
+		r.TemporaryFailures++
+	}
+	r.DegradationLevel = min(16, r.DegradationLevel+1)
+	until := now.Add(retryBackoff(rule.CooldownSeconds, r.DegradationLevel))
+	r.FailureKind, r.Reason, r.LastFailureAt, r.HoldUntil = kind, reason, &now, &until
+	r.RecoveryTrial, r.RecoveryStartedAt, r.RecoveryDeadline = false, nil, nil
+	r.GoodWindows = 0
+}
+func retryFailed(r *ActionRecord, reason string, now time.Time, rule config.Rule) {
+	r.RecoveryFailures++
+	if r.LastFailureAt == nil || !r.LastFailureAt.Equal(now) {
+		r.DegradationLevel = min(16, r.DegradationLevel+1)
+	}
+	until := now.Add(retryBackoff(rule.CooldownSeconds, r.DegradationLevel))
+	r.HoldUntil, r.RecoveryTrial, r.RecoveryStartedAt, r.RecoveryDeadline = &until, false, nil, nil
+	r.Reason = "临时状态恢复未确认：" + reason
+}
+func resetHealth(r *ActionRecord) {
+	r.HoldUntil, r.SampleSince, r.LastFailureAt, r.RecoveryStartedAt, r.RecoveryDeadline = nil, nil, nil, nil, nil
+	r.DegradationLevel = 0
+	r.RecoveryTrial, r.AccountFault = false, false
+	resetQualityProgress(r)
+	r.QualityTracks, r.QualityLegacyAnchor = nil, ""
+	r.QualityHistoryRetry = nil
+	r.FailureKind, r.Reason, r.LastBadSample, r.LastTemporaryState = "", "", "", ""
+	r.FailureCount, r.TemporaryFailures, r.RecoveryAttempts, r.RecoveryFailures = 0, 0, 0, 0
+	r.LastRecoveryAttempt = time.Time{}
+	r.NextRetryAt = nil
+}
+func startTrial(item *managedAccount, since, now time.Time, rule config.Rule) {
+	r := item.record
+	rememberPriorQualityHistory(r, item, since)
+	r.HoldUntil, r.SampleSince, r.RecoveryStartedAt = nil, &now, &now
+	r.LastTemporaryState = ""
+	deadline := now.Add(time.Duration(max(600, recoverySeconds(rule)*3)) * time.Second)
+	r.RecoveryDeadline, r.RecoveryTrial = &deadline, true
+	cursor := r.LastQualityWindow
+	resetQualityProgress(r)
+	r.LastQualityWindow = cursor
+	item.row.clearUsage()
+}
+func finishRecovery(r *ActionRecord) {
+	r.FailureKind, r.Reason = "", ""
+	r.HoldUntil, r.RecoveryStartedAt, r.RecoveryDeadline = nil, nil, nil
+	r.RecoveryTrial, r.DegradationLevel = false, 0
+}
+func updateRecordStatus(ledger *Ledger, item *managedAccount, now time.Time) {
+	r := item.record
+	if r == nil || item.row.State == "" {
+		return
+	}
+	if r.LastState != item.row.State {
+		r.LastState, r.StatusSince = item.row.State, now
+		logEvent(ledger, item.row.ID, item.row.Name, item.row.State, item.row.Reason, now)
+	}
+	fillRecordDetails(&item.row, r)
+}
+func fillRecordDetails(row *AccountStatus, r *ActionRecord) {
+	row.StatusSince = &r.StatusSince
+	row.QualityBadWindows, row.QualityGoodWindows = r.BadWindows, r.GoodWindows
+	row.FailureKind, row.FailureCount = r.FailureKind, r.FailureCount
+	row.TemporaryFailures, row.RecoveryAttempts, row.RecoveryFailures = r.TemporaryFailures, r.RecoveryAttempts, r.RecoveryFailures
+	row.LastFailureAt, row.NextRetryAt = r.LastFailureAt, r.HoldUntil
+	row.RecoveryAt = r.HoldUntil
+	if !r.LastRecoveryAttempt.IsZero() {
+		at := r.LastRecoveryAttempt
+		row.LastRecoveryAttemptAt = &at
+	}
+	row.DegradationLevel, row.RecoveryTrial = r.DegradationLevel, r.RecoveryTrial
+	row.RecoveryStartedAt, row.RecoveryDeadline = r.RecoveryStartedAt, r.RecoveryDeadline
+	row.ErrorMetricsAvailable, row.ErrorRequests = false, nil
+}
+func clearHealthDetails(row *AccountStatus) {
+	row.StatusSince, row.LastFailureAt, row.LastRecoveryAttemptAt, row.NextRetryAt, row.RecoveryAt = nil, nil, nil, nil, nil
+	row.FailureKind, row.DegradedTo = "", ""
+	row.FailureCount, row.TemporaryFailures, row.RecoveryAttempts, row.RecoveryFailures, row.DegradationLevel = 0, 0, 0, 0, 0
+	row.QualityBadWindows, row.QualityGoodWindows = 0, 0
+	row.RecoveryTrial, row.RecoveryStartedAt, row.RecoveryDeadline = false, nil, nil
+}
+
+// Persist the attempt and its next eligible retry before clearing host runtime
+// state. A crash or an uncertain HTTP result never creates a tight reset loop.
+func (e *Engine) clearTemporary(ctx context.Context, api API, store Store, ledger *Ledger, item *managedAccount, now time.Time) error {
+	r := item.record
+	fresh, err := api.Account(ctx, item.row.ID)
+	if err != nil {
+		return err
+	}
+	if !reconcileOwned(fresh, r) {
+		r.Phase = "manual_change"
+		item.row.State, item.row.Reason = "manual_change", "恢复提交前检测到人工修改，已停止接管"
+		return errors.New("账号设置已变化，取消恢复")
+	}
+	if fresh.Status == "error" {
+		markAccountFault(item, fresh, now)
+		return errors.New("账号已进入 error，取消临时状态清理")
+	}
+	if fresh.Status != "active" || (fresh.ExpiresAt != nil && *fresh.ExpiresAt <= now.Unix()) {
+		return errors.New("账号状态需要人工处理，取消临时状态清理")
+	}
+	if fresh.TemporaryUnavailableReason(now) == "" {
+		item.account = fresh
+		return nil
+	}
+	r.RecoveryAttempts++
+	r.LastRecoveryAttempt = now
+	next := now.Add(retryBackoff(r.Policy.CooldownSeconds, r.DegradationLevel))
+	r.HoldUntil = &next
+	if err := save(ctx, store, ledger); err != nil {
+		return err
+	}
+	if err := api.ClearError(ctx, item.row.ID); err != nil {
+		return err
+	}
+	confirmed, err := api.Account(ctx, item.row.ID)
+	if err != nil {
+		return err
+	}
+	if !reconcileOwned(confirmed, r) {
+		r.Phase = "manual_change"
+		item.row.State, item.row.Reason = "manual_change", "清理后检测到人工修改，停止接管"
+		return errors.New("账号设置变化，恢复未接管")
+	}
+	if confirmed.Status == "error" {
+		markAccountFault(item, confirmed, now)
+		return errors.New("账号已进入 error，停止自动恢复")
+	}
+	if !confirmed.Active(now) {
+		return errors.New("宿主仍有限流、过载或账号异常，恢复尚未确认")
+	}
+	item.account = confirmed
+	item.row.Status, item.row.Priority, item.row.Schedulable = confirmed.Status, confirmed.Priority, confirmed.Schedulable
+	item.row.Availability = ""
 	return nil
 }
 
 func exclusiveExitReason(rule config.Rule, row AccountStatus) string {
-	if rule.ExclusiveMinCacheRatio > 0 && row.Complete && row.Requests >= rule.MinRequests &&
+	if rule.ExclusiveMinCacheRatio > 0 && row.Complete && row.Requests >= config.QualityWindowRequests &&
 		row.CacheRatio != nil && *row.CacheRatio < rule.ExclusiveMinCacheRatio {
 		return fmt.Sprintf("缓存命中比例 %.1f%% 低于独占下限 %.1f%%，退出独占并按本组规则调用", *row.CacheRatio*100, rule.ExclusiveMinCacheRatio*100)
 	}
-	if rule.ExclusiveMaxAverageFirstTokenMs > 0 && row.AverageFirstTokenMs != nil && row.FirstTokenSamples >= 20 &&
+	if rule.ExclusiveMaxAverageFirstTokenMs > 0 && row.AverageFirstTokenMs != nil && row.FirstTokenSamples >= config.QualityWindowRequests &&
 		*row.AverageFirstTokenMs > rule.ExclusiveMaxAverageFirstTokenMs {
-		return fmt.Sprintf("最近 20 次平均首字时间 %.0f ms 超过独占上限 %.0f ms，退出独占并按本组规则调用", *row.AverageFirstTokenMs, rule.ExclusiveMaxAverageFirstTokenMs)
+		return fmt.Sprintf("最近 %d 次平均首字时间 %.0f ms 超过独占上限 %.0f ms，退出独占并按本组规则调用", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.ExclusiveMaxAverageFirstTokenMs)
 	}
 	return ""
 }
 
 func matchesOriginal(a adminapi.Account, r *ActionRecord) bool {
-	return a.Status == r.OriginalStatus && a.Priority == r.OriginalPriority && a.Schedulable == r.OriginalSchedulable
+	return a.Priority == r.OriginalPriority && a.Schedulable == r.OriginalSchedulable
 }
 
 func reconcileOwned(a adminapi.Account, r *ActionRecord) bool {
-	if a.ID != r.AccountID || a.Type != "apikey" || a.Platform != r.Platform || a.Status != r.OriginalStatus {
+	if a.ID != r.AccountID || a.Type != "apikey" || a.Platform != r.Platform ||
+		(a.Status != r.OriginalStatus && a.Status != "active" && a.Status != "error") {
 		return false
+	}
+	// Host SetError owns the accompanying closure. Accept it at every readback,
+	// and never restore the old open switch over that host-owned state.
+	if a.Status == "error" && !a.Schedulable && (a.Priority == r.TargetPriority ||
+		(r.PendingField == "priority" && a.Priority == r.PendingPriority)) {
+		r.TargetSchedulable, r.OriginalSchedulable = false, false
+		if r.PendingField != "priority" || a.Priority == r.PendingPriority {
+			r.TargetPriority, r.PendingField, r.Phase = a.Priority, "", "active"
+		}
+		return true
 	}
 	if a.Priority == r.TargetPriority && a.Schedulable == r.TargetSchedulable {
 		return true
@@ -342,10 +651,27 @@ func (e *Engine) syncSchedule(ctx context.Context, api API, store Store, ledger 
 			}
 			return errors.New("账号已变化，已停止接管")
 		}
+		if fresh.Status == "error" && !item.restoring {
+			markAccountFault(item, fresh, e.clock().UTC())
+			if err := save(ctx, store, ledger); err != nil {
+				return err
+			}
+			return errors.New("账号已进入 error，取消本次调度写入")
+		}
+		if item.restoring {
+			desiredSchedulable = r.OriginalSchedulable
+			if field == "schedulable" && r.TargetSchedulable == desiredSchedulable {
+				continue
+			}
+		}
 		if field == "schedulable" && item.schedulable && !item.restoring {
 			checked := item.row
 			applyRateChoice(&checked, item.setting, item.snapshot, checked.RateMode != "waiting", e.clock().UTC())
-			if !fresh.Active(e.clock().UTC()) || checked.EffectiveRate == nil {
+			available := fresh.Active(e.clock().UTC())
+			if item.setting.Group == "always_on" {
+				available = fresh.Status == "active" && (fresh.ExpiresAt == nil || *fresh.ExpiresAt > e.clock().UTC().Unix())
+			}
+			if !available || (item.setting.Group != "always_on" && checked.EffectiveRate == nil) {
 				return errors.New("提交前账号或倍率已不可用，取消开放调度")
 			}
 		}
@@ -365,6 +691,7 @@ func (e *Engine) syncSchedule(ctx context.Context, api API, store Store, ledger 
 		if err != nil {
 			return err
 		}
+		item.account = confirmed
 		if !reconcileOwned(confirmed, r) {
 			r.Phase, item.row.State = "manual_change", "manual_change"
 			item.row.Reason = "管理写入未确认，请人工核对账号设置"
@@ -373,6 +700,13 @@ func (e *Engine) syncSchedule(ctx context.Context, api API, store Store, ledger 
 				return err
 			}
 			return errors.New("管理写入未确认，保留记录等待人工核对")
+		}
+		if confirmed.Status == "error" && !item.restoring {
+			markAccountFault(item, confirmed, e.clock().UTC())
+			if err := save(ctx, store, ledger); err != nil {
+				return err
+			}
+			return errors.New("账号已进入 error，停止后续调度写入")
 		}
 		if r.PendingField != "" {
 			// A successful HTTP response can still precede an unapplied write.
@@ -413,21 +747,21 @@ func evaluate(rule config.Rule, row AccountStatus) (bad, known bool, reason, sam
 		}
 	}
 	if rule.MinCacheRatio > 0 {
-		if !row.Complete || row.CacheRatio == nil || row.Requests < rule.MinRequests {
+		if !row.Complete || row.CacheRatio == nil || row.Requests < config.QualityWindowRequests {
 			known = false
 		} else if *row.CacheRatio < rule.MinCacheRatio {
 			return true, true, fmt.Sprintf("缓存命中比例 %.1f%% 低于本组下限 %.1f%%", *row.CacheRatio*100, rule.MinCacheRatio*100), "cache:" + row.SampleKey
 		}
 	}
 	if rule.MaxAverageFirstTokenMs > 0 {
-		if row.AverageFirstTokenMs == nil || row.FirstTokenSamples < 20 {
+		if row.AverageFirstTokenMs == nil || row.FirstTokenSamples < config.QualityWindowRequests {
 			known = false
 		} else if *row.AverageFirstTokenMs > rule.MaxAverageFirstTokenMs {
-			return true, true, fmt.Sprintf("最近 20 次平均首字时间 %.0f ms 超过本组上限 %.0f ms", *row.AverageFirstTokenMs, rule.MaxAverageFirstTokenMs), "ttft:" + row.FirstTokenSampleKey
+			return true, true, fmt.Sprintf("最近 %d 次平均首字时间 %.0f ms 超过本组上限 %.0f ms", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.MaxAverageFirstTokenMs), "ttft:" + row.FirstTokenSampleKey
 		}
 	}
 	if !known {
-		if row.EffectiveRate == nil {
+		if rule.MaxRateMultiplier > 0 && row.EffectiveRate == nil {
 			return false, false, "有效倍率未知，等待上游倍率或设置固定倍率", ""
 		}
 		return false, false, "有效样本不足或采集不完整，等待监控数据", ""

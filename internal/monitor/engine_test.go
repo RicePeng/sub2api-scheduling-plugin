@@ -13,55 +13,106 @@ import (
 )
 
 type memoryStore struct {
-	raw  []byte
-	fail bool
+	raw               []byte
+	fail              bool
+	extra             map[string][]byte
+	maxValueSize      int
+	historyWriteError bool
 }
 
-func (s *memoryStore) Get(context.Context, string) ([]byte, error) {
-	return append([]byte{}, s.raw...), nil
+func (s *memoryStore) Get(_ context.Context, key string) ([]byte, error) {
+	if key == "actions" {
+		return append([]byte{}, s.raw...), nil
+	}
+	return append([]byte{}, s.extra[key]...), nil
 }
-func (s *memoryStore) Set(_ context.Context, _ string, value []byte) error {
+func (s *memoryStore) Set(_ context.Context, key string, value []byte) error {
 	if s.fail {
 		return errors.New("storage failed")
 	}
-	s.raw = append([]byte{}, value...)
+	if s.historyWriteError && strings.HasPrefix(key, "quality-history.") {
+		return errors.New("history storage failed")
+	}
+	if s.maxValueSize > 0 && len(value) > s.maxValueSize {
+		return errors.New("storage value exceeds host cap")
+	}
+	if key == "actions" {
+		s.raw = append([]byte{}, value...)
+	} else {
+		if s.extra == nil {
+			s.extra = map[string][]byte{}
+		}
+		s.extra[key] = append([]byte{}, value...)
+	}
 	return nil
 }
 
 type fakeAPI struct {
 	accounts           map[int64]adminapi.Account
+	accountErrors      map[int64]error
 	usage              map[int64]adminapi.Window
 	rates              map[int64]*adminapi.RateSnapshot
 	rateError          error
 	rateReads          int
 	usageReads, writes int
+	clearCalls         int
 	writeError         bool
+	priorityWriteError map[int64]error
 	ignoreWrite        bool
+	clearError         bool
 	beforeWrite        func()
+	beforeAccount      func(int64)
 	lastUsageSince     time.Time
+	usageThresholds    map[int64]int64
 }
 
 func (f *fakeAPI) Account(_ context.Context, id int64) (adminapi.Account, error) {
+	if f.beforeAccount != nil {
+		f.beforeAccount(id)
+	}
+	if err := f.accountErrors[id]; err != nil {
+		return adminapi.Account{}, err
+	}
 	a, ok := f.accounts[id]
 	if !ok {
 		return adminapi.Account{}, errors.New("not found")
 	}
 	return a, nil
 }
-func (f *fakeAPI) RecentUsage(_ context.Context, id int64, _ time.Time) (adminapi.Window, error) {
-	f.usageReads++
-	return f.usage[id], nil
-}
-func (f *fakeAPI) RecentUsageSince(_ context.Context, id int64, since, _ time.Time) (adminapi.Window, error) {
+func (f *fakeAPI) RecentUsageSince(_ context.Context, id int64, since, _ time.Time, minInputTokens int64) (adminapi.Window, error) {
 	f.usageReads++
 	f.lastUsageSince = since
-	return f.usage[id], nil
+	if f.usageThresholds == nil {
+		f.usageThresholds = map[int64]int64{}
+	}
+	f.usageThresholds[id] = minInputTokens
+	w := f.usage[id]
+	w.MinInputTokens = minInputTokens
+	if w.QualityCurrent != nil {
+		current := *w.QualityCurrent
+		current.MinInputTokens = minInputTokens
+		w.QualityCurrent = &current
+	}
+	for i := range w.QualityWindows {
+		w.QualityWindows[i].MinInputTokens = minInputTokens
+	}
+	return w, nil
 }
 func (f *fakeAPI) Rates(context.Context) (map[int64]*adminapi.RateSnapshot, error) {
 	f.rateReads++
 	return f.rates, f.rateError
 }
 func (f *fakeAPI) Close() {}
+func (f *fakeAPI) ClearError(_ context.Context, id int64) error {
+	f.clearCalls++
+	if f.clearError {
+		return errors.New("clear failed")
+	}
+	a := f.accounts[id]
+	a.RateLimitResetAt, a.OverloadUntil, a.TempUnschedulableUntil = nil, nil, nil
+	f.accounts[id] = a
+	return nil
+}
 func (f *fakeAPI) SetSchedulable(_ context.Context, id int64, value bool) error {
 	if f.beforeWrite != nil {
 		f.beforeWrite()
@@ -82,6 +133,9 @@ func (f *fakeAPI) SetPriority(_ context.Context, id int64, value int) error {
 		f.beforeWrite()
 	}
 	f.writes++
+	if err := f.priorityWriteError[id]; err != nil {
+		return err
+	}
 	a := f.accounts[id]
 	a.Priority = value
 	if !f.ignoreWrite {
@@ -94,11 +148,11 @@ func (f *fakeAPI) SetPriority(_ context.Context, id int64, value int) error {
 }
 
 func account(id int64, platform, kind string, priority int, schedulable bool) adminapi.Account {
-	rate := 1.25
+	rate := .1
 	return adminapi.Account{ID: id, Name: "test", Platform: platform, Type: kind, Status: "active", Schedulable: schedulable, Priority: priority, RateMultiplier: &rate}
 }
 func lowCache() adminapi.Window {
-	return adminapi.Window{Complete: true, Requests: 20, InputTokens: 100, CacheReadTokens: 300}
+	return adminapi.Window{Complete: true, Requests: 15, InputTokens: 100, CacheReadTokens: 300}
 }
 func setup(t *testing.T, accounts ...adminapi.Account) (*Engine, config.Config, *fakeAPI, *memoryStore, time.Time) {
 	t.Helper()
@@ -323,7 +377,8 @@ func TestUnavailableStatusKeepsSpecificHostReason(t *testing.T) {
 	e, _, _, _, now := setup(t, a)
 	e.Cycle(context.Background(), now)
 	state := snapshotAccount(t, e, 7)
-	if state.State != "unavailable" || state.Availability == "" || state.Reason != state.Availability || !strings.Contains(state.Reason, "过载") {
+	if state.State != "temporary_retry" || state.FailureKind != "temporary" || state.Availability == "" ||
+		state.Reason != state.Availability || !strings.Contains(state.Reason, "过载") {
 		t.Fatalf("specific host unavailability reason was lost: %+v", state)
 	}
 }
@@ -362,6 +417,25 @@ func TestOnlyAPIKeysAreReadForUsageOrManaged(t *testing.T) {
 	}
 }
 
+func TestAccountReadFailureBlocksOnlyItsPlatform(t *testing.T) {
+	e, c, api, _, now := setup(t,
+		account(7, "openai", "apikey", 3, true),
+		account(8, "openai", "apikey", 4, false),
+		account(9, "anthropic", "apikey", 3, true),
+		account(10, "anthropic", "apikey", 4, true))
+	c.AccountSettings[0].Group, c.AccountSettings[1].Group = "excellent", "good"
+	c.AccountSettings[2].Group, c.AccountSettings[3].Group = "excellent", "good"
+	api.accountErrors = map[int64]error{7: errors.New("read unavailable")}
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	e.Cycle(context.Background(), now)
+	if api.accounts[8].Schedulable || !api.accounts[9].Schedulable || api.accounts[10].Schedulable ||
+		snapshotAccount(t, e, 7).State != "unknown" || snapshotAccount(t, e, 8).State != "group_wait" {
+		t.Fatalf("read uncertainty escaped its platform or opened an unsafe same-platform group: %+v", e.Snapshot().Accounts)
+	}
+}
+
 func TestEarlierGroupAvailabilityAndPerGroupCacheRule(t *testing.T) {
 	excellent := account(7, "openai", "apikey", 3, true)
 	good := account(8, "openai", "apikey", 4, true)
@@ -371,8 +445,8 @@ func TestEarlierGroupAvailabilityAndPerGroupCacheRule(t *testing.T) {
 	rule := c.GroupRules["excellent"]
 	rule.MaxRateMultiplier = 0
 	rule.MinCacheRatio = .8
-	rule.MinRequests = 20
-	rule.TriggerSamples = 1
+	rule.MinRequests = 15
+	rule.TriggerSamples = 2
 	rule.CooldownSeconds = 30
 	c.GroupRules["excellent"] = rule
 	goodRule := c.GroupRules["good"]
@@ -383,6 +457,13 @@ func TestEarlierGroupAvailabilityAndPerGroupCacheRule(t *testing.T) {
 		t.Fatal(err)
 	}
 	e.Cycle(context.Background(), now)
+	at := now.Add(180 * time.Second)
+	qualityCycle(e, api, at, 7, qualityWindow(at, 100, "model-a", "sync", .75))
+	if !api.accounts[7].Schedulable || api.accounts[8].Schedulable {
+		t.Fatal("one unconfirmed quality window switched the group")
+	}
+	at = now.Add(360 * time.Second)
+	qualityCycle(e, api, at, 7, qualityWindow(at, 120, "model-a", "sync", .75))
 	if api.accounts[7].Schedulable || !api.accounts[8].Schedulable {
 		t.Fatalf("fallback did not activate the next healthy group: excellent=%+v good=%+v", api.accounts[7], api.accounts[8])
 	}
@@ -391,33 +472,39 @@ func TestEarlierGroupAvailabilityAndPerGroupCacheRule(t *testing.T) {
 	}
 }
 
-func TestAverageTTFTThresholdPausesOnlyAfterTwentyValidSamples(t *testing.T) {
+func TestAverageTTFTThresholdPausesOnlyAfterFifteenValidSamples(t *testing.T) {
 	e, c, api, _, now := setup(t, account(7, "openai", "apikey", 5, true))
 	rule := c.GroupRules["general"]
 	rule.MaxRateMultiplier = 0
 	rule.MaxAverageFirstTokenMs = 1000
 	rule.MinCacheRatio = 0
-	rule.TriggerSamples = 1
+	rule.TriggerSamples = 2
 	rule.CooldownSeconds = 30
 	c.GroupRules["general"] = rule
-	value := 1500.0
-	w := api.usage[7]
-	w.AverageFirstTokenMs = &value
-	w.FirstTokenSamples = 19
-	api.usage[7] = w
 	if err := e.Apply(c); err != nil {
 		t.Fatal(err)
 	}
 	e.Cycle(context.Background(), now)
+	at := now.Add(180 * time.Second)
+	b := qualityWindow(at, 100, "model-a", "stream", .9)
+	b.FirstTokenSamples, b.AverageFirstTokenMs = 14, nil
+	qualityCycle(e, api, at, 7, b)
 	if !api.accounts[7].Schedulable {
-		t.Fatal("19 TTFT samples triggered a pause")
+		t.Fatal("14 TTFT samples triggered a pause")
 	}
-	w.FirstTokenSamples = 20
-	w.FirstTokenSampleKey = "2026-11-18T11:59:00Z:42"
-	api.usage[7] = w
-	e.Cycle(context.Background(), now.Add(time.Minute))
+	at = now.Add(360 * time.Second)
+	b = qualityWindow(at, 120, "model-a", "stream", .9)
+	b.FirstTokenSamples, b.AverageFirstTokenMs = 15, ptr(1500)
+	qualityCycle(e, api, at, 7, b)
+	if !api.accounts[7].Schedulable {
+		t.Fatal("incomplete TTFT sample counted toward confirmation")
+	}
+	at = now.Add(540 * time.Second)
+	b = qualityWindow(at, 140, "model-a", "stream", .9)
+	b.FirstTokenSamples, b.AverageFirstTokenMs = 15, ptr(1500)
+	qualityCycle(e, api, at, 7, b)
 	if api.accounts[7].Schedulable {
-		t.Fatal("20 valid slow TTFT samples did not pause the account")
+		t.Fatal("two complete slow TTFT windows did not pause the account")
 	}
 }
 
@@ -520,13 +607,15 @@ func TestNewSessionClearsHoldWithoutDiscardingUnrestoredOwnership(t *testing.T) 
 	a := account(7, "openai", "apikey", 4, true)
 	a.RateMultiplier = ptr(.1)
 	e, c, api, store, now := setup(t, a)
-	rule := c.GroupRules["general"]
-	rule.TriggerSamples = 1
-	c.GroupRules["general"] = rule
+	configureQuality(&c, "general", .8, 0)
 	if err := e.Apply(c); err != nil {
 		t.Fatal(err)
 	}
 	e.Cycle(context.Background(), now)
+	for i, seconds := range []int{180, 360} {
+		at := now.Add(time.Duration(seconds) * time.Second)
+		qualityCycle(e, api, at, 7, qualityWindow(at, 100+i*20, "model-a", "sync", .75))
+	}
 	if ledgerOf(t, store).Records["7"].HoldUntil == nil {
 		t.Fatal("test did not create an exception hold")
 	}
@@ -543,7 +632,7 @@ func TestNewSessionClearsHoldWithoutDiscardingUnrestoredOwnership(t *testing.T) 
 		t.Fatalf("reset lost ownership or retained a hold: %+v", record)
 	}
 	api.usage[7] = adminapi.Window{}
-	e.Cycle(context.Background(), now.Add(time.Minute))
+	e.Cycle(context.Background(), now.Add(7*time.Minute))
 	if row := snapshotAccount(t, e, 7); row.State != "sampling" || !row.Schedulable || row.Requests != 0 {
 		t.Fatalf("fresh session did not resume sampling: %+v", row)
 	}
@@ -551,7 +640,7 @@ func TestNewSessionClearsHoldWithoutDiscardingUnrestoredOwnership(t *testing.T) 
 	if err := e.Apply(c); err != nil {
 		t.Fatal(err)
 	}
-	e.Cycle(context.Background(), now.Add(2*time.Minute))
+	e.Cycle(context.Background(), now.Add(8*time.Minute))
 	if api.accounts[7].Priority != 4 || !api.accounts[7].Schedulable {
 		t.Fatal("reset discarded the original recoverable settings")
 	}
@@ -608,13 +697,13 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 		ttftSamples int
 		exits       bool
 	}{
-		{"cache_below", .75, 20, true, 500, 20, true},
-		{"ttft_above", .9, 20, true, 1500, 20, true},
-		{"ttft_independent_of_cache", .9, 0, false, 1500, 20, true},
-		{"cache_boundary", .8, 20, true, 1000, 20, false},
-		{"cache_sample_shortage", .75, 19, true, 500, 20, false},
-		{"cache_incomplete", .75, 20, false, 500, 20, false},
-		{"ttft_sample_shortage", .9, 20, true, 1500, 19, false},
+		{"cache_below", .75, 15, true, 500, 15, true},
+		{"ttft_above", .9, 15, true, 1500, 15, true},
+		{"ttft_independent_of_cache", .9, 0, false, 1500, 15, true},
+		{"cache_boundary", .8, 15, true, 1000, 15, false},
+		{"cache_sample_shortage", .75, 14, true, 500, 15, false},
+		{"cache_incomplete", .75, 15, false, 500, 15, false},
+		{"ttft_sample_shortage", .9, 15, true, 1500, 14, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			a, b := account(7, "openai", "apikey", 4, true), account(8, "openai", "apikey", 5, true)
@@ -630,7 +719,7 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 			if err := e.Apply(c); err != nil {
 				t.Fatal(err)
 			}
-			healthy := adminapi.Window{Complete: true, Requests: 20, InputTokens: 10, CacheReadTokens: 90, AverageFirstTokenMs: ptr(500), FirstTokenSamples: 20}
+			healthy := adminapi.Window{Complete: true, Requests: 15, InputTokens: 10, CacheReadTokens: 90, AverageFirstTokenMs: ptr(500), FirstTokenSamples: 15}
 			api.usage[7], api.usage[8] = healthy, healthy
 			e.Cycle(context.Background(), now)
 			if !api.accounts[7].Schedulable || api.accounts[8].Schedulable {
@@ -733,26 +822,28 @@ func TestTemporaryMoveAndRemovalRestoreOwnedSettings(t *testing.T) {
 }
 
 func TestCooldownRetriesWithoutImmediatelyReusingTriggeringSamples(t *testing.T) {
-	e, c, api, _, now := setup(t, account(7, "openai", "apikey", 5, true))
-	rule := c.GroupRules["general"]
-	rule.MinCacheRatio, rule.TriggerSamples, rule.CooldownSeconds = .9, 1, 30
-	c.GroupRules["general"] = rule
-	w := api.usage[7]
-	w.SampleKey = "sample-a"
-	api.usage[7] = w
+	e, c, api, store, now := setup(t, account(7, "openai", "apikey", 5, true))
+	configureQuality(&c, "general", .9, 0)
 	if err := e.Apply(c); err != nil {
 		t.Fatal(err)
 	}
 	e.Cycle(context.Background(), now)
-	if api.accounts[7].Schedulable {
+	for i, seconds := range []int{180, 360} {
+		at := now.Add(time.Duration(seconds) * time.Second)
+		qualityCycle(e, api, at, 7, qualityWindow(at, 100+i*20, "m", "sync", .2))
+	}
+	record := ledgerOf(t, store).Records["7"]
+	if api.accounts[7].Schedulable || record.HoldUntil == nil {
 		t.Fatal("cache exception did not pause")
 	}
-	e.Cycle(context.Background(), now.Add(31*time.Second))
-	if state := snapshotAccount(t, e, 7); !api.accounts[7].Schedulable || state.State != "sampling" || state.Requests != 0 {
+	trialAt := *record.HoldUntil
+	e.Cycle(context.Background(), trialAt)
+	if state := snapshotAccount(t, e, 7); !api.accounts[7].Schedulable || state.State != "recovering" || state.Requests != 0 {
 		t.Fatalf("cooldown did not reopen account in a fresh sampling window: %+v", state)
 	}
-	e.Cycle(context.Background(), now.Add(32*time.Second))
-	if api.lastUsageSince.IsZero() {
+	api.usage[7] = adminapi.Window{}
+	e.Cycle(context.Background(), trialAt.Add(time.Second))
+	if !api.lastUsageSince.Equal(trialAt) {
 		t.Fatal("recovery did not start a new usage sampling window")
 	}
 }
@@ -868,7 +959,7 @@ func TestDefaultRateRuleClosesItsAccountAndKeepsOtherGroupAvailable(t *testing.T
 	e, c, api, _, now := setup(t, account(7, "openai", "apikey", 5, true), account(8, "openai", "apikey", 5, true))
 	c.AccountSettings[0].Group, c.AccountSettings[1].Group = "excellent", "good"
 	c.AccountSettings[0].RateMode, c.AccountSettings[0].FixedRate = "upstream", nil
-	c.AccountSettings[1].RateMode, c.AccountSettings[1].FixedRate = "fixed", ptr(1)
+	c.AccountSettings[1].RateMode, c.AccountSettings[1].FixedRate = "fixed", ptr(.1)
 	rule := c.GroupRules["excellent"]
 	rule.MinCacheRatio, rule.MaxRateMultiplier, rule.TriggerSamples = 0, .2, 1
 	c.GroupRules["excellent"] = rule
@@ -879,7 +970,9 @@ func TestDefaultRateRuleClosesItsAccountAndKeepsOtherGroupAvailable(t *testing.T
 	if api.accounts[7].Schedulable || !api.accounts[8].Schedulable {
 		t.Fatalf("default rate rule failed to close the first group and open the next: excellent=%+v good=%+v", api.accounts[7], api.accounts[8])
 	}
-	if state := snapshotAccount(t, e, 7); state.State != "paused" || state.EffectiveRate == nil || *state.EffectiveRate != 1 || state.RateMode != "default" {
+	if state := snapshotAccount(t, e, 7); state.State != "policy_wait" || state.EffectiveRate == nil ||
+		*state.EffectiveRate != 1 || state.RateMode != "default" || state.FailureCount != 0 ||
+		state.DegradationLevel != 0 || state.NextRetryAt != nil {
 		t.Fatalf("default fallback did not follow the group exception rule: %+v", state)
 	}
 }

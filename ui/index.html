@@ -17,6 +17,7 @@
         <span>账号调用管理</span>
       </a>
       <div class="topbar-right">
+        <span class="version-label" id="top-version">v0.1.1-Beta1</span>
         <span class="preview-tag"><span class="preview-dot"></span><span id="bridge-state">正在连接宿主</span></span>
       </div>
     </header>
@@ -33,18 +34,20 @@
       <p id="action-message" class="inline-error" role="status" aria-live="polite" hidden></p>
 
       <nav class="section-nav" aria-label="页面目录">
-        <label class="platform-switch">平台 <select id="platform-select" aria-label="平台种类"><option value="unknown">待识别</option></select></label>
-        <a class="active" aria-current="page" href="#view-monitor">账号监控</a>
-        <a href="#view-groups">账号管理 <span class="tab-count" id="account-count">0</span></a>
-        <a href="#view-rules">监控规则</a>
-        <a href="#view-connection">管理连接与运行状态</a>
+        <div class="section-nav-links">
+          <label class="platform-switch">平台 <select id="platform-select" aria-label="平台种类"><option value="unknown">待识别</option></select></label>
+          <a class="active" aria-current="page" href="#view-monitor">账号监控</a>
+          <a href="#view-groups">账号管理 <span class="tab-count" id="account-count">0</span></a>
+          <a href="#view-rules">监控规则</a>
+          <a href="#view-connection">管理连接与运行状态</a>
+        </div>
+        <button class="automation-action is-off" id="automation-toggle" type="button" disabled title="先保存管理连接并添加账号">启动监控</button>
       </nav>
 
       <section class="view" id="view-groups" aria-labelledby="groups-heading">
         <div class="view-heading">
           <div><h2 id="groups-heading">账号管理</h2><p>添加账号、调整所属组和倍率、设置组内是否参与调用。</p></div>
           <div class="group-view-actions">
-            <button class="automation-action is-off" id="automation-toggle" type="button" disabled title="先保存管理连接并添加账号">启用</button>
             <div class="sort-control"><span>组内倍率排序</span><select id="sort-direction" aria-label="组内倍率排序方向"><option value="asc">低 → 高</option><option value="desc">高 → 低</option></select></div>
             <div id="add-account-form" class="add-account-form">
               <label class="sr-only" for="new-account-id">账号 ID</label>
@@ -60,7 +63,7 @@
 
       <section class="view" id="view-monitor" aria-labelledby="monitor-heading">
         <div class="view-heading">
-          <div><h2 id="monitor-heading">账号监控</h2><p>按调用组查看账号状态、采样数据和不可调用原因。</p></div>
+          <div><h2 id="monitor-heading">账号监控</h2><p>每个账号连续展示最近 3 个已完成窗口，最新在前；另行显示当前采样进度与剔除数量。</p></div>
           <div class="monitor-refresh"><span class="state-indicator"></span><span id="monitor-poll-label">采样未启用</span><span id="monitor-countdown" class="monitor-countdown">未启用请求</span><button id="manual-poll" class="button manual-poll-button" type="button" disabled>手动请求</button></div>
         </div>
         <section class="account-overview" aria-labelledby="account-overview-heading">
@@ -72,7 +75,7 @@
             <div class="overview-stat needs-rate"><dt>待设置倍率</dt><dd id="overview-needs-rate">0</dd></div>
           </dl>
         </section>
-        <div class="route-strip" aria-label="当前调用顺序" hidden>
+        <div class="route-strip" aria-label="当前调用组与顺序" hidden>
           <span class="route-label">调用顺序</span>
           <div id="route-order" class="route-order"></div>
         </div>
@@ -89,8 +92,8 @@
       </section>
 
       <section class="view" id="view-rules" aria-labelledby="rules-heading">
-        <div class="view-heading"><div><h2 id="rules-heading">分组异常条件</h2><p>优秀、良好、一般、备用四组分别设置优先级与异常条件；临时组不参与调用。</p></div><span class="runtime-pill" id="rules-platform">四组独立设置</span></div>
-        <p class="rules-sampling-note">首字时间取最近 20 次有效调用的平均值，不足 20 次不触发；缓存取最近 20 次调用。任一条件连续命中后停用，到期重新尝试，旧样本不会立即再次触发。</p>
+        <div class="view-heading"><div><h2 id="rules-heading">分组监控规则</h2><p>五组独立设置采样容量门槛；常开组不执行质量停用，普通四组分别配置异常条件。</p></div><span class="runtime-pill" id="rules-platform">五组独立设置</span></div>
+        <p class="rules-sampling-note">默认只采集输入上下文 ≥ 40K Token 的请求，账号每 15 次有效调用组成一个不重叠窗口；小请求与容量未知请求分别统计剔除数。按窗口总体指标判断，默认连续 2 个异常窗口且达到确认时长后确认故障。首字时间样本不足 15 次时，不判定该项异常。恢复试运行使用原组优先级，确认健康前保留较低组兜底。</p>
         <div class="rule-layout group-rules-list" id="group-rules-list"></div>
         <div class="rule-layout shared-rules">
           <section class="rule-section">
@@ -98,9 +101,10 @@
             <div class="setting-row setting-row-input"><div><strong>采集间隔</strong><span>后台刷新真实调用指标。</span></div><div class="unit-input"><input id="poll-seconds" type="number" min="15" max="3600" value="60"><span>秒</span></div></div>
             <div class="setting-row setting-row-input"><div><strong>管理请求超时</strong><span>单次管理 API 请求的等待时间。</span></div><div class="unit-input"><input id="timeout-seconds" type="number" min="3" max="120" value="15"><span>秒</span></div></div>
           </section>
-          <section class="rule-section"><div class="rule-section-head"><div><h3>调用顺序</h3><p>上组全部不可用时，才开放下一组。</p></div></div><div class="flow-steps" id="flow-steps"></div><p class="rule-footnote">第五组临时不参与调用。启用自动管理后，同步各组优先级并控制调度开关。</p></section>
+          <section class="rule-section"><div class="rule-section-head"><div><h3>调用顺序</h3><p>常开组独立并行；普通组按优秀 → 良好 → 一般 → 备用依次回退。</p></div></div><div class="flow-steps" id="flow-steps"></div><p class="rule-footnote">临时组不参与调用。启动监控后，同步各组优先级并自动管理调度。</p></section>
         </div>
-        <div class="preview-actions"><p id="save-message" role="status">四个调用组的设置按平台独立保存，临时组固定关闭调度、优先级 99。</p><button id="save-rules" type="button" class="button primary">保存规则</button></div>
+        <p class="rules-sampling-note rule-customized-note">绿色参数表示与默认设置不同；恢复默认后请保存规则。</p>
+        <div class="preview-actions"><p id="save-message" role="status">调用组设置按平台独立保存，临时组固定关闭调度、优先级 99。</p><div class="rule-actions"><button id="reset-rules" type="button" class="button" title="恢复当前平台五个分组的默认规则和优先级，保存后生效">恢复默认设置</button><button id="save-rules" type="button" class="button primary">保存规则</button></div></div>
       </section>
 
       <section class="view" id="view-connection" aria-labelledby="connection-heading">
@@ -122,7 +126,7 @@
             <dl class="runtime-grid">
               <div><dt>运行模式</dt><dd id="runtime-mode">未连接</dd></div>
               <div><dt>恢复记录存储</dt><dd id="runtime-storage">—</dd></div>
-              <div><dt>插件版本</dt><dd id="runtime-version">0.1.0</dd></div>
+              <div><dt>插件版本</dt><dd id="runtime-version">0.1.1-Beta1</dd></div>
               <div><dt>最近采集</dt><dd id="runtime-last-poll">—</dd></div>
               <div><dt>下次采集</dt><dd id="runtime-next-poll">—</dd></div>
               <div><dt>当前平台</dt><dd id="runtime-platform">—</dd></div>
@@ -158,7 +162,7 @@
   <input id="rate-source" type="hidden" value="account">
   <input id="max-rate-multiplier" type="hidden" value="0">
   <input id="min-cache-percent" type="hidden" value="80">
-  <input id="min-requests" type="hidden" value="20">
+  <input id="min-requests" type="hidden" value="15">
   <input id="recovery-samples" type="hidden" value="3">
   <input id="cooldown-seconds" type="hidden" value="300">
   <input id="action" type="hidden" value="deprioritize">
@@ -187,12 +191,43 @@
         <div><dt>所属调用组</dt><dd id="runtime-detail-group"></dd></div>
         <div><dt>宿主可调用性</dt><dd id="runtime-detail-host"></dd></div>
         <div><dt>当前倍率</dt><dd id="runtime-detail-rate"></dd></div>
-        <div><dt>宿主优先级</dt><dd id="runtime-detail-priority"></dd></div>
+        <div><dt>当前 / 配置优先级</dt><dd id="runtime-detail-priority"></dd></div>
         <div><dt>缓存样本</dt><dd id="runtime-detail-cache"></dd></div>
         <div><dt>首字时间样本</dt><dd id="runtime-detail-ttft"></dd></div>
-        <div hidden><dt>恢复安排</dt><dd id="runtime-detail-recovery"></dd></div>
+        <div><dt>采样门槛</dt><dd id="runtime-detail-filter"></dd></div>
+        <div hidden><dt>恢复阶段</dt><dd id="runtime-detail-recovery"></dd></div>
+        <div><dt>错误请求（502 等）</dt><dd id="runtime-detail-error-requests"></dd></div>
       </dl>
-      <div class="runtime-detail-note"><strong>状态说明</strong><p id="runtime-detail-reason"></p><p id="runtime-detail-error" hidden></p></div>
+      <dl class="runtime-detail-grid" id="runtime-diagnostics" hidden>
+        <div><dt>状态开始时间</dt><dd id="runtime-detail-status-since"></dd></div>
+        <div><dt>失败类型</dt><dd id="runtime-detail-failure-kind"></dd></div>
+        <div><dt>累计故障 / 临时异常</dt><dd id="runtime-detail-failure-counts"></dd></div>
+        <div><dt>恢复尝试 / 失败</dt><dd id="runtime-detail-recovery-counts"></dd></div>
+        <div><dt>最近故障</dt><dd id="runtime-detail-last-failure"></dd></div>
+        <div><dt>最近恢复尝试</dt><dd id="runtime-detail-last-attempt"></dd></div>
+        <div><dt>下次重试</dt><dd id="runtime-detail-next-retry"></dd></div>
+        <div><dt>重试退避等级</dt><dd id="runtime-detail-degradation"></dd></div>
+        <div><dt>试运行开始</dt><dd id="runtime-detail-recovery-start"></dd></div>
+        <div><dt>试运行截止</dt><dd id="runtime-detail-recovery-deadline"></dd></div>
+        <div><dt>质量窗口进度</dt><dd id="runtime-detail-quality-windows"></dd></div>
+      </dl>
+      <section class="runtime-account-events" aria-labelledby="runtime-account-events-heading">
+        <h3 id="runtime-account-events-heading">最近 5 条操作</h3>
+        <ol id="runtime-account-events"></ol>
+        <p id="runtime-account-events-empty" class="runtime-scan-note">暂无操作记录</p>
+      </section>
+      <section class="runtime-quality" id="runtime-quality" aria-labelledby="runtime-quality-heading" hidden>
+        <h3 id="runtime-quality-heading">最近 3 个采样窗口</h3>
+        <p class="runtime-scan-note" id="runtime-quality-scan-limit" hidden>已达本轮扫描上限，部分窗口可能未列出。</p>
+        <ol id="runtime-quality-windows"></ol>
+        <p class="runtime-scan-note" id="runtime-quality-empty">暂无已完成窗口</p>
+        <details id="runtime-quality-current" hidden>
+          <summary id="runtime-quality-current-summary">当前采样</summary>
+          <ol id="runtime-quality-current-windows"></ol>
+        </details>
+      </section>
+      <div class="runtime-detail-note"><strong>状态说明</strong><p id="runtime-detail-reason"></p></div>
+      <div class="runtime-detail-note sync-error" id="runtime-sync-error" hidden><strong>采集 / 同步错误</strong><p id="runtime-detail-error"></p></div>
       <div class="dialog-actions"><button class="button" type="button" data-close-runtime>关闭</button></div>
     </section>
   </dialog>

@@ -12,7 +12,10 @@ import (
 	"net/url"
 	"sort"
 	"strconv"
+	"strings"
 	"time"
+
+	"sub2api.local/cache-manager/internal/config"
 )
 
 type Account struct {
@@ -69,33 +72,128 @@ func (a Account) AvailabilityReason(now time.Time) string {
 	return ""
 }
 
+func (a Account) TemporaryUnavailableReason(now time.Time) string {
+	reasons := []string{}
+	for _, item := range []struct {
+		name  string
+		until *time.Time
+	}{
+		{"宿主限流", a.RateLimitResetAt},
+		{"账号过载", a.OverloadUntil},
+		{"临时不可调度", a.TempUnschedulableUntil},
+	} {
+		if item.until != nil && now.Before(*item.until) {
+			reasons = append(reasons, fmt.Sprintf("%s至 %s", item.name, item.until.UTC().Format(time.RFC3339)))
+		}
+	}
+	return strings.Join(reasons, "；")
+}
+
 type Window struct {
-	Requests               int
-	InputTokens            int64
-	CacheCreationTokens    int64
-	CacheReadTokens        int64
-	AccountRate            *float64
-	Complete               bool
-	AverageFirstTokenMs    *float64
-	FirstTokenSamples      int
-	FirstTokenComplete     bool
-	FirstTokenLimitReached bool
-	SampleKey              string
-	FirstTokenSampleKey    string
+	Requests                int
+	InputTokens             int64
+	CacheCreationTokens     int64
+	CacheReadTokens         int64
+	AccountRate             *float64
+	Complete                bool
+	AverageFirstTokenMs     *float64
+	FirstTokenSamples       int
+	FirstTokenComplete      bool
+	FirstTokenLimitReached  bool
+	SampleKey               string
+	SampleEndKey            string
+	FirstTokenSampleKey     string
+	QualityCurrent          *QualityWindow
+	QualityWindows          []QualityWindow
+	qualityRead             bool
+	qualityRows             []Usage
+	qualityOldest           Usage
+	QualityScanLimitReached bool
+	MinInputTokens          int64
+	ExcludedSmallRequests   int
+	ExcludedUnknownRequests int
 }
 
 func (w Window) Ratio() *float64 {
-	total := w.InputTokens + w.CacheCreationTokens + w.CacheReadTokens
-	if !w.Complete || w.Requests == 0 || total <= 0 {
+	if !w.Complete || w.Requests == 0 {
 		return nil
 	}
-	value := float64(w.CacheReadTokens) / float64(total)
+	return cacheRatio(w.InputTokens, w.CacheCreationTokens, w.CacheReadTokens)
+}
+
+// A QualityWindow contains consecutive eligible calls across the account.
+// Models explain its usage composition but never define window boundaries.
+type QualityWindow struct {
+	Requests                int
+	WindowKnown             bool
+	InputTokens             int64
+	CacheCreationTokens     int64
+	CacheReadTokens         int64
+	AverageFirstTokenMs     *float64
+	FirstTokenSamples       int
+	FirstSample             string
+	LastSample              string
+	MinInputTokens          int64
+	ExcludedSmallRequests   int
+	ExcludedUnknownRequests int
+	Models                  []QualityModelUsage
+}
+
+func (w QualityWindow) Ratio() *float64 {
+	if !w.WindowKnown {
+		return nil
+	}
+	return cacheRatio(w.InputTokens, w.CacheCreationTokens, w.CacheReadTokens)
+}
+
+type QualityModelUsage struct {
+	Model               string   `json:"model"`
+	RequestType         string   `json:"request_type"`
+	Requests            int      `json:"requests"`
+	CacheRatio          *float64 `json:"cache_ratio"`
+	AverageFirstTokenMs *float64 `json:"average_first_token_ms"`
+	FirstTokenSamples   int      `json:"first_token_samples"`
+}
+
+type qualityTotals struct {
+	requests, firstTokenSamples             int
+	inputTokens, creationTokens, readTokens int64
+	ttftSum                                 float64
+}
+
+func (s *qualityTotals) add(u Usage) {
+	s.requests++
+	s.inputTokens += *u.InputTokens
+	s.creationTokens += *u.CacheCreationTokens
+	s.readTokens += *u.CacheReadTokens
+	if u.FirstTokenMs != nil && *u.FirstTokenMs >= 0 {
+		s.firstTokenSamples++
+		s.ttftSum += float64(*u.FirstTokenMs)
+	}
+}
+
+func (s qualityTotals) averageTTFT() *float64 {
+	if s.firstTokenSamples == 0 {
+		return nil
+	}
+	v := s.ttftSum / float64(s.firstTokenSamples)
+	return &v
+}
+
+func cacheRatio(input, creation, read int64) *float64 {
+	total := input + creation + read
+	if total <= 0 {
+		return nil
+	}
+	value := float64(read) / float64(total)
 	return &value
 }
 
 type Usage struct {
 	ID                  int64     `json:"id"`
 	AccountID           int64     `json:"account_id"`
+	Model               string    `json:"model"`
+	RequestType         string    `json:"request_type"`
 	CreatedAt           time.Time `json:"created_at"`
 	InputTokens         *int64    `json:"input_tokens"`
 	CacheCreationTokens *int64    `json:"cache_creation_tokens"`
@@ -104,106 +202,301 @@ type Usage struct {
 	FirstTokenMs        *int64    `json:"first_token_ms"`
 }
 
-// RecentUsage reads the latest 20 calls for cache metrics, and independently
-// the latest 20 valid TTFT observations. A fixed upper timestamp excludes calls
-// arriving during pagination. Missing/negative TTFT never becomes zero.
+func (u Usage) inputContext() (int64, bool) {
+	// Reject values that cannot be accumulated safely across a full window.
+	const maxComponent = math.MaxInt64 / (3 * config.QualityWindowRequests)
+	var total int64
+	for _, n := range []*int64{u.InputTokens, u.CacheCreationTokens, u.CacheReadTokens} {
+		if n == nil || *n < 0 || *n > maxComponent {
+			return 0, false
+		}
+		total += *n
+	}
+	return total, true
+}
+
+func newerUsage(a, b Usage) bool {
+	if a.CreatedAt.Equal(b.CreatedAt) {
+		return a.ID > b.ID
+	}
+	return a.CreatedAt.After(b.CreatedAt)
+}
+
+// RecentUsage reads the latest calls for cache metrics, and independently the
+// latest valid TTFT observations, both using the configured fixed window size.
+// A fixed upper timestamp excludes calls arriving during pagination.
 func (c *Client) RecentUsage(ctx context.Context, id int64, until time.Time) (Window, error) {
-	return c.RecentUsageSince(ctx, id, time.Time{}, until)
+	return c.RecentUsageSince(ctx, id, time.Time{}, until, config.DefaultMinInputTokens)
 }
 
 // RecentUsageSince keeps samples from before an explicit resume out of the new
-// evaluation window.
-func (c *Client) RecentUsageSince(ctx context.Context, id int64, since, until time.Time) (Window, error) {
-	w := Window{Complete: true, FirstTokenComplete: true}
-	seen := map[int64]bool{}
+// evaluation window. Account quality windows use the same capacity-eligible calls for
+// both metrics and never treat management errors as usage.
+func (c *Client) RecentUsageSince(ctx context.Context, id int64, since, until time.Time, minInputTokens int64) (Window, error) {
+	const sampleSize, pageSize, maxPages = config.QualityWindowRequests, 100, 50
+	w := Window{Complete: true, FirstTokenComplete: true, MinInputTokens: minInputTokens}
+	seen := map[int64]struct{}{}
 	var ttftSum float64
-	var previous time.Time
+	var previous Usage
+	fail := func(err error, invalidateAggregate bool) (Window, error) {
+		w.qualityRows = nil // Never seal a window from failed pagination.
+		if invalidateAggregate || w.Requests < sampleSize || w.FirstTokenSamples < sampleSize {
+			w.Complete, w.FirstTokenComplete, w.AverageFirstTokenMs = false, false, nil
+		}
+		return w, err
+	}
 	query := url.Values{"account_id": {strconv.FormatInt(id, 10)},
-		"page_size": {"100"}, "sort_by": {"created_at"}, "sort_order": {"desc"},
+		"page_size": {strconv.Itoa(pageSize)}, "sort_by": {"created_at"}, "sort_order": {"desc"},
 		"end_date": {until.UTC().Format("2006-01-02")}, "timezone": {"UTC"}}
 	if !since.IsZero() {
 		query.Set("start_date", since.UTC().Format("2006-01-02"))
 	}
-	for page := 1; page <= 50; page++ {
+	for page := 1; page <= maxPages; page++ {
 		var data struct {
-			Items *[]Usage `json:"items"`
+			Items    *[]Usage `json:"items"`
+			Page     *int     `json:"page"`
+			PageSize *int     `json:"page_size"`
+			Pages    *int     `json:"pages"`
 		}
 		query.Set("page", strconv.Itoa(page))
 		if err := c.request(ctx, http.MethodGet, "/admin/usage", query, nil, &data); err != nil {
-			w.Complete, w.FirstTokenComplete, w.AverageFirstTokenMs = false, false, nil
-			return w, err
+			return fail(err, false)
 		}
 		if data.Items == nil {
-			w.Complete, w.FirstTokenComplete = false, false
-			return w, errors.New("用量响应缺少 items 列表")
+			return fail(errors.New("用量响应缺少 items 列表"), true)
 		}
 		items := *data.Items
-		sort.SliceStable(items, func(i, j int) bool {
-			if items[i].CreatedAt.Equal(items[j].CreatedAt) {
-				return items[i].ID > items[j].ID
-			}
-			return items[i].CreatedAt.After(items[j].CreatedAt)
-		})
+		if len(items) > pageSize || (data.Page != nil && *data.Page != page) ||
+			(data.PageSize != nil && *data.PageSize != pageSize) ||
+			(data.Pages != nil && (*data.Pages < 1 || (*data.Pages > page && len(items) < pageSize))) {
+			return fail(errors.New("用量响应分页不兼容，未执行自动判定"), true)
+		}
 		for _, u := range items {
 			if u.ID <= 0 || u.AccountID != id || u.CreatedAt.IsZero() {
-				w.Complete, w.FirstTokenComplete, w.AverageFirstTokenMs = false, false, nil
-				return w, errors.New("用量数据缺失或账号不匹配")
+				return fail(errors.New("用量数据缺失或账号不匹配"), true)
 			}
-			// Results are sorted newest first, so the next pages cannot add
-			// any samples from this session once we cross its start time.
-			if !since.IsZero() && u.CreatedAt.Before(since) {
-				break
-			}
-			if u.CreatedAt.After(until) || seen[u.ID] {
+		}
+		// Host order is (created_at DESC, id DESC), including across pages.
+		sort.SliceStable(items, func(i, j int) bool { return newerUsage(items[i], items[j]) })
+		reachedStart, advanced := false, false
+		for _, u := range items {
+			if _, ok := seen[u.ID]; ok {
 				continue
 			}
-			if !previous.IsZero() && u.CreatedAt.After(previous) {
-				w.Complete, w.FirstTokenComplete = false, false
-				return w, errors.New("用量记录顺序不兼容，未执行自动判定")
+			if previous.ID != 0 && newerUsage(u, previous) {
+				return fail(errors.New("用量记录顺序不兼容，未执行自动判定"), true)
 			}
-			previous = u.CreatedAt
-			seen[u.ID] = true
-			key := u.CreatedAt.UTC().Format(time.RFC3339Nano) + ":" + strconv.FormatInt(u.ID, 10)
-			if w.Requests < 20 {
-				if w.SampleKey == "" {
-					w.SampleKey = key
+			previous = u
+			advanced = true
+			seen[u.ID] = struct{}{}
+			if !since.IsZero() && u.CreatedAt.Before(since) {
+				reachedStart = true
+				break
+			}
+			if u.CreatedAt.After(until) {
+				continue
+			}
+			if w.AccountRate == nil && u.AccountRate != nil && validNumber(*u.AccountRate) {
+				w.AccountRate = u.AccountRate
+			}
+			total, capacityKnown := u.inputContext()
+			if !capacityKnown || total < minInputTokens {
+				if w.Requests < sampleSize {
+					countExcluded(capacityKnown, &w.ExcludedSmallRequests, &w.ExcludedUnknownRequests)
 				}
-				w.Requests++
-				if u.InputTokens == nil || u.CacheCreationTokens == nil || u.CacheReadTokens == nil ||
-					*u.InputTokens < 0 || *u.CacheCreationTokens < 0 || *u.CacheReadTokens < 0 {
-					w.Complete = false
-				} else {
+			}
+			key := u.CreatedAt.UTC().Format(time.RFC3339Nano) + ":" + strconv.FormatInt(u.ID, 10)
+			ttftKnown := u.FirstTokenMs != nil && *u.FirstTokenMs >= 0
+			eligible := capacityKnown && total >= minInputTokens
+			if eligible {
+				if w.Requests < sampleSize {
+					if w.SampleKey == "" {
+						w.SampleKey = key
+					}
+					w.Requests++
+					w.SampleEndKey = key
 					w.InputTokens += *u.InputTokens
 					w.CacheCreationTokens += *u.CacheCreationTokens
 					w.CacheReadTokens += *u.CacheReadTokens
 				}
-				if w.AccountRate == nil && u.AccountRate != nil && validNumber(*u.AccountRate) {
-					w.AccountRate = u.AccountRate
+				if w.FirstTokenSamples < sampleSize && ttftKnown {
+					if w.FirstTokenSampleKey == "" {
+						w.FirstTokenSampleKey = key
+					}
+					w.FirstTokenSamples++
+					ttftSum += float64(*u.FirstTokenMs)
+					if w.FirstTokenSamples == sampleSize {
+						value := ttftSum / sampleSize
+						w.AverageFirstTokenMs = &value
+					}
 				}
 			}
-			if w.FirstTokenSamples < 20 && u.FirstTokenMs != nil && *u.FirstTokenMs >= 0 {
-				if w.FirstTokenSampleKey == "" {
-					w.FirstTokenSampleKey = key
-				}
-				w.FirstTokenSamples++
-				ttftSum += float64(*u.FirstTokenMs)
-			}
-			if w.Requests == 20 && w.FirstTokenSamples == 20 {
-				value := ttftSum / 20
-				w.AverageFirstTokenMs = &value
-				return w, nil
+			w.qualityRows = append(w.qualityRows, u)
+		}
+		if len(items) == pageSize && !advanced {
+			return fail(errors.New("用量分页未前进，未执行自动判定"), true)
+		}
+		if reachedStart || len(items) < pageSize || (data.Pages != nil && page >= *data.Pages) {
+			break
+		}
+		if page == maxPages {
+			w.QualityScanLimitReached = true
+			w.FirstTokenLimitReached = w.FirstTokenSamples < sampleSize
+			w.FirstTokenComplete = !w.FirstTokenLimitReached
+			if w.Requests < sampleSize {
+				w.Complete = false
 			}
 		}
-		if len(items) < 100 || (!since.IsZero() && items[len(items)-1].CreatedAt.Before(since)) {
-			return w, nil
-		}
 	}
-	w.FirstTokenComplete = false
-	w.FirstTokenLimitReached = true
-	if w.Requests < 20 {
-		w.Complete = false
-	}
+	w.qualityOldest, w.qualityRead = previous, true
 	return w, nil
+}
+
+func countExcluded(known bool, small, unknown *int) {
+	if known {
+		(*small)++
+	} else {
+		(*unknown)++
+	}
+}
+
+func ParseSampleKey(key string) (time.Time, int64, bool) {
+	i := strings.LastIndex(key, ":")
+	if i < 0 {
+		return time.Time{}, 0, false
+	}
+	at, err := time.Parse(time.RFC3339Nano, key[:i])
+	id, idErr := strconv.ParseInt(key[i+1:], 10, 64)
+	return at, id, err == nil && idErr == nil && id > 0
+}
+
+func qualityRequestIdentity(u Usage) bool {
+	return strings.TrimSpace(u.Model) != "" && strings.TrimSpace(u.RequestType) != "" &&
+		u.RequestType != "unknown" && u.RequestType != "cyber"
+}
+
+func sampleKey(u Usage) string {
+	return u.CreatedAt.UTC().Format(time.RFC3339Nano) + ":" + strconv.FormatInt(u.ID, 10)
+}
+
+// QualityPredecessors recovers the most recent sealed windows from a capped scan
+// whose decision boundary is still visible. Only windows with their preceding
+// boundary in the scan have trustworthy request and exclusion counts.
+func (w Window) QualityPredecessors(since time.Time, through string, limit int) []QualityWindow {
+	at, id, ok := ParseSampleKey(through)
+	if !ok || limit <= 0 {
+		return nil
+	}
+	end := Usage{CreatedAt: at, ID: id}
+	first := -1
+	var boundary Usage
+	requests := 0
+	for i, u := range w.qualityRows {
+		if first == -1 {
+			if newerUsage(u, end) {
+				continue
+			}
+			if u.ID != id || !u.CreatedAt.Equal(at) {
+				return nil
+			}
+			first = i
+		}
+		total, known := u.inputContext()
+		if !qualityRequestIdentity(u) || !known || total < w.MinInputTokens {
+			continue
+		}
+		if requests > 0 && requests%config.QualityWindowRequests == 0 {
+			boundary = u
+			if requests/config.QualityWindowRequests == limit {
+				break
+			}
+		}
+		requests++
+	}
+	if first == -1 || boundary.ID == 0 {
+		return nil
+	}
+	w.qualityRows = w.qualityRows[first:]
+	w.SealQuality(since, sampleKey(boundary))
+	return w.QualityWindows
+}
+
+// SealQuality replays the validated usage batch oldest-first after the account's
+// durable cursor. The latest verified boundary is required to align a capped scan.
+func (w *Window) SealQuality(since time.Time, after string) {
+	if !w.qualityRead {
+		return
+	}
+	var anchor Usage
+	if at, id, ok := ParseSampleKey(after); ok && !at.Before(since) {
+		anchor = Usage{CreatedAt: at, ID: id}
+	}
+	w.QualityWindows = nil
+	known := !w.QualityScanLimitReached || (anchor.ID != 0 && !newerUsage(w.qualityOldest, anchor))
+	current := QualityWindow{MinInputTokens: w.MinInputTokens, WindowKnown: known}
+	w.QualityCurrent = &current
+	if !known {
+		return
+	}
+	type modelKey struct{ model, requestType string }
+	totals := qualityTotals{}
+	models := map[modelKey]*qualityTotals{}
+	finish := func() {
+		current.InputTokens, current.CacheCreationTokens, current.CacheReadTokens =
+			totals.inputTokens, totals.creationTokens, totals.readTokens
+		current.FirstTokenSamples = totals.firstTokenSamples
+		// A missing TTFT never makes an otherwise complete account window
+		// look healthy. Per-model averages are diagnostic and show their sample counts.
+		if totals.firstTokenSamples == totals.requests {
+			current.AverageFirstTokenMs = totals.averageTTFT()
+		}
+		current.Models = make([]QualityModelUsage, 0, len(models))
+		for key, model := range models {
+			current.Models = append(current.Models, QualityModelUsage{Model: key.model, RequestType: key.requestType,
+				Requests: model.requests, CacheRatio: cacheRatio(model.inputTokens, model.creationTokens, model.readTokens),
+				AverageFirstTokenMs: model.averageTTFT(), FirstTokenSamples: model.firstTokenSamples})
+		}
+		sort.Slice(current.Models, func(i, j int) bool {
+			a, b := current.Models[i], current.Models[j]
+			if a.Model == b.Model {
+				return a.RequestType < b.RequestType
+			}
+			return a.Model < b.Model
+		})
+	}
+	for i := len(w.qualityRows) - 1; i >= 0; i-- {
+		u := w.qualityRows[i]
+		if (anchor.ID != 0 && !newerUsage(u, anchor)) || u.CreatedAt.Before(since) {
+			continue
+		}
+		if !qualityRequestIdentity(u) {
+			continue
+		}
+		total, capacityKnown := u.inputContext()
+		if !capacityKnown || total < w.MinInputTokens {
+			countExcluded(capacityKnown, &current.ExcludedSmallRequests, &current.ExcludedUnknownRequests)
+			continue
+		}
+		sample := sampleKey(u)
+		if current.Requests == 0 {
+			current.FirstSample = sample
+		}
+		current.LastSample = sample
+		current.Requests++
+		totals.add(u)
+		key := modelKey{u.Model, u.RequestType}
+		if models[key] == nil {
+			models[key] = &qualityTotals{}
+		}
+		models[key].add(u)
+		if current.Requests == config.QualityWindowRequests {
+			finish()
+			w.QualityWindows = append(w.QualityWindows, current)
+			current = QualityWindow{MinInputTokens: w.MinInputTokens, WindowKnown: true}
+			totals, models = qualityTotals{}, map[modelKey]*qualityTotals{}
+		}
+	}
+	finish()
 }
 
 type RateSnapshot struct {
@@ -304,6 +597,10 @@ func (c *Client) Account(ctx context.Context, id int64) (Account, error) {
 func (c *Client) SetSchedulable(ctx context.Context, id int64, value bool) error {
 	return c.request(ctx, http.MethodPost, fmt.Sprintf("/admin/accounts/%d/schedulable", id),
 		nil, map[string]bool{"schedulable": value}, nil)
+}
+
+func (c *Client) ClearError(ctx context.Context, id int64) error {
+	return c.request(ctx, http.MethodPost, fmt.Sprintf("/admin/accounts/%d/clear-error", id), nil, nil, nil)
 }
 
 func (c *Client) SetPriority(ctx context.Context, id int64, value int) error {
