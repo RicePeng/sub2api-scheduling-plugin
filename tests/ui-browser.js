@@ -52,10 +52,10 @@
   assert(await field('excellent', 'trigger-samples').inputValue() === '2' && await field('excellent', 'recovery-samples').inputValue() === '2' &&
     await field('excellent', 'trigger-samples').getAttribute('min') === '2' && await field('excellent', 'sample-count').count() === 0, 'legacy one-window rules are floored to two, sample size is not editable');
   const samplingRule = await ui.locator('#view-rules > .rules-sampling-note').first().innerText();
-  assert(samplingRule.includes('20 次有效调用') && samplingRule.includes('各自去掉最高 2 个和最低 2 个值') &&
-    samplingRule.includes('中间 16 个值的算术平均') && samplingRule.includes('首字时间样本满 20 次才参加判断') &&
-    (await ui.locator('[data-rule-group=excellent] .rule-footnote').innerText()).includes('最近 20 次有效调用'),
-    'sampling and exclusive rules explain the window size, per-metric trimming, and TTFT minimum');
+  assert(samplingRule.includes('缓存比例取全部 20 次有效调用的算术平均') &&
+    samplingRule.includes('首字时间样本满 20 次后，取中间 16 个值的算术平均') &&
+    (await ui.locator('[data-rule-group=excellent] .setting-row').filter({ hasText: '独占缓存下限' }).innerText()).includes('最近 20 次有效调用'),
+    'sampling and exclusive rules explain the all-sample cache mean and TTFT trimming');
   assert(await ui.locator('#view-groups input[type=number]').count() === 0, 'priorities edited only in rule cards');
   assert(await ui.locator('.group-section').count() === 6 && await ui.locator('#flow-steps .flow-step').count() === 5 &&
     (await ui.locator('#flow-steps .parallel').innerText()).replace(/\s/g, '') === '常开·并行P5', 'always-on has a parallel path; temporary excluded from routing');
@@ -367,9 +367,9 @@
     }
   }
   await monitorButton('2081').click();
-  assert((await ui.locator('#runtime-detail-cache').innerText()).includes('78.0% · 20 次原始窗口值 · 判断均值16') &&
+  assert(await ui.locator('#runtime-detail-cache').innerText() === '78.0% · 20 次' &&
     (await ui.locator('#runtime-detail-ttft').innerText()).includes('850 ms · 原始窗口值 · 判断均值16'),
-    'monitor distinguishes raw window metrics from the trimmed decision mean');
+    'monitor displays the all-sample cache mean and the trimmed TTFT mean');
   await ui.locator('[data-close-runtime]').last().click();
   await page.evaluate(() => {
     const since = new Date().toISOString();
@@ -526,7 +526,7 @@
   assert(await historyRows('2081').nth(1).isHidden() && await historyRows('2081').nth(2).isHidden(), 'later completed periods remain collapsed');
   assert(
     previousSample.includes('有效 20/20 · ≥40K') && previousSample.includes('剔除 6：小请求 6 / 容量未知 0') &&
-    (await historyRows('2081').nth(0).locator('.monitor-window-sample > span').getAttribute('title')).includes('各自去掉最高 2 个和最低 2 个值') &&
+    (await historyRows('2081').nth(0).locator('.monitor-window-sample > span').getAttribute('title')).includes('缓存比例取全部 20 次有效调用的均值') &&
     (await windowMetric(historyRows('2081').nth(1), 'ttft')).includes('812ms'), 'completed periods distinguish cache, exclusions and TTFT');
   assert(await historyRows('2084').count() === 1 && (await historyRows('2084').innerText()).includes('33.5%') &&
     await monitorButton('2084').locator('.monitor-status-label').innerText() === '可调用',

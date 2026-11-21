@@ -12,12 +12,12 @@
   const callGroups = groups.filter((group) => group.callable !== false);
   const qualityWindowSize = 20;
   const qualityAverageSize = 16;
-  const qualityAverageHint = '完整窗口内，缓存比例与首字时间各自去掉最高 2 个和最低 2 个值，取中间 16 个值的均值。';
+  const qualityAverageHint = '缓存比例取全部 20 次有效调用的均值。首字时间取中间 16 个值的均值。';
   const confirmWindows = (count) => Math.max(2, Number(count) || 2);
   const groupPriorityDefaults = Object.fromEntries(groups.map(({ id, priority }) => [id, priority]));
   const knownPlatforms = ['openai', 'anthropic', 'gemini', 'vertex', 'antigravity', 'grok', 'deepseek', 'qwen', 'moonshot', 'zhipu', 'minimax', 'siliconflow', 'ollama', 'openrouter', 'openai_compatible'];
   const platformNames = { openai: 'OpenAI', anthropic: 'Anthropic', gemini: 'Gemini', vertex: 'Vertex', antigravity: 'Antigravity', grok: 'Grok', deepseek: 'DeepSeek', qwen: 'Qwen', moonshot: 'Moonshot', zhipu: '智谱', minimax: 'MiniMax', siliconflow: '硅基流动', ollama: 'Ollama', openrouter: 'OpenRouter', openai_compatible: 'OpenAI Compatible', unknown: '待识别' };
-  const defaultRule = (group) => ({ min_cache_ratio: .8, max_average_first_token_ms: 10000, exclusive_rate_below: group === 'excellent' ? .05 : 0,
+  const defaultRule = (group) => ({ min_cache_ratio: .8, max_average_first_token_ms: 10000, first_token_periods: 5, exclusive_rate_below: group === 'excellent' ? .05 : 0,
     exclusive_min_cache_ratio: .8, exclusive_max_average_first_token_ms: 10000, max_rate_multiplier: .2,
     min_requests: qualityWindowSize, min_input_tokens: 40000, trigger_samples: 2, recovery_samples: 2, confirmation_seconds: 180, recovery_seconds: 300,
     cooldown_seconds: 300, action: 'pause', priority_penalty: 10 });
@@ -55,6 +55,7 @@
   let disposed = false;
   let savedConfig = null;
   let runtimeHostname = '';
+  let overallMonitoring = { state: 'idle', reason: '监控未启动' };
   let sequence = 0;
   let pollTimer = null;
   let eventLog = [];
@@ -85,7 +86,7 @@
   const groupPriority = (id, platform = activePlatform) => id === 'temporary' ? 99 : platformGroupPriorities[platform]?.[id] ?? baseGroupPriorities[id];
   const currentRule = (group, platform = activePlatform) => {
     const rule = { ...groupRules[group], ...platformGroupRules[platform]?.[group] };
-    return { ...rule, min_input_tokens: rule.min_input_tokens || 40000, confirmation_seconds: rule.confirmation_seconds || 180, recovery_seconds: rule.recovery_seconds || 300 };
+    return { ...rule, min_input_tokens: rule.min_input_tokens || 40000, first_token_periods: rule.first_token_periods || 5, confirmation_seconds: rule.confirmation_seconds || 180, recovery_seconds: rule.recovery_seconds || 300 };
   };
   const stateLabels = { paused: '异常停用', deprioritized: '异常停用', temporary: '临时组不调用', temporary_retry: '恢复退避中', recovery_wait: '重试到期 · 等待前序组', sampling: '等待采样',
     needs_rate: '待设置倍率', group_wait: '等待前序组', exclusive_wait: '独占等待', unavailable: '不可调用',
@@ -128,18 +129,19 @@
         <div class="condition-row"><label class="check-line"><input data-field="rate-enabled" type="checkbox" aria-label="${group.name}组启用倍率上限条件"><span>有效倍率超过上限</span></label><div class="unit-input"><input data-field="rate-maximum" type="number" min="0.01" max="1000000" step="0.01" aria-label="${group.name}组有效倍率上限"><span>×</span></div></div>
         <div class="condition-row"><label class="check-line"><input data-field="cache-enabled" type="checkbox" aria-label="${group.name}组启用缓存条件"><span>缓存比例低于下限</span></label><div class="unit-input"><input data-field="cache-minimum" type="number" min="0.1" max="100" step="0.1" aria-label="${group.name}组缓存下限"><span>%</span></div></div>
         <div class="condition-row"><label class="check-line"><input data-field="ttft-enabled" type="checkbox" aria-label="${group.name}组启用首字时间条件"><span>平均首字时间超过上限</span></label><div class="unit-input"><input data-field="ttft-maximum" type="number" min="1" max="3600000" step="1" aria-label="${group.name}组首字时间上限"><span>ms</span></div></div>
+        <div class="setting-row setting-row-input"><div><strong>平均首字时间周期</strong><span>独立累计完整质量窗口，默认 5 个周期后才判断首字时间。</span></div><div class="unit-input"><input data-field="ttft-periods" type="number" min="1" max="20" step="1" aria-label="${group.name}组平均首字时间周期"><span>个</span></div></div>
         <div class="setting-row setting-row-input"><div><strong>连续异常窗口</strong><span>账号窗口总体指标至少连续异常 2 次才停用。</span></div><div class="unit-input"><input data-field="trigger-samples" type="number" min="2" max="100" step="1" aria-label="${group.name}组连续异常窗口数"><span>个</span></div></div>
         <div class="setting-row setting-row-input"><div><strong>异常确认时长</strong><span>启动监控后先等待此时长；确认质量异常时，异常窗口的时间跨度也须达到此时长。</span></div><div class="unit-input"><input data-field="confirmation-seconds" type="number" min="60" max="86400" step="1" aria-label="${group.name}组异常确认时长"><span>秒</span></div></div>
         <div class="setting-row setting-row-input"><div><strong>恢复确认窗口</strong><span>试运行须通过至少 2 个连续健康账号窗口。</span></div><div class="unit-input"><input data-field="recovery-samples" type="number" min="2" max="100" step="1" aria-label="${group.name}组恢复确认窗口数"><span>个</span></div></div>
         <div class="setting-row setting-row-input"><div><strong>恢复确认时长</strong><span>达到健康窗口数和最短试运行时长后才确认恢复。</span></div><div class="unit-input"><input data-field="recovery-seconds" type="number" min="60" max="86400" step="1" aria-label="${group.name}组恢复确认时长"><span>秒</span></div></div>`}
         <div class="setting-row setting-row-input"><div><strong>失败重试基准</strong><span>默认 300 秒；连续失败后间隔每次加倍，最长 24 小时。</span></div><div class="unit-input"><input data-field="retry-seconds" type="number" min="30" max="86400" step="1" aria-label="${group.name}组失败重试基准（秒）"><span>秒</span></div></div>
         ${group.special ? '<div class="condition-row"><label class="check-line"><input data-field="elite-enabled" type="checkbox" aria-label="优秀组启用独占策略"><span>倍率低于下限时独占调用</span></label><div class="unit-input"><input data-field="elite-minimum" type="number" min="0.01" max="1000000" step="0.01" aria-label="优秀组独占倍率下限"><span>×</span></div></div>' +
-          '<div class="setting-row setting-row-input"><div><strong>独占缓存下限</strong><span>缓存去极值均值低于此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-cache-minimum" type="number" min="0.1" max="100" step="0.1" aria-label="优秀组独占缓存下限"><span>%</span></div></div>' +
-          '<div class="setting-row setting-row-input"><div><strong>独占平均首字时间上限</strong><span>首字去极值均值超过此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-ttft-maximum" type="number" min="1" max="3600000" step="1" aria-label="优秀组独占首字时间上限"><span>ms</span></div></div>' +
-          '<p class="rule-footnote">独占仅保留倍率最低的合格账号。按最近 20 次有效调用计算去极值后的均值，触发任一条件即按本组普通规则继续调用。样本不足时不判失败。</p>' : ''}
+          '<div class="setting-row setting-row-input"><div><strong>独占缓存下限</strong><span>最近 20 次有效调用的平均缓存比例低于此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-cache-minimum" type="number" min="0.1" max="100" step="0.1" aria-label="优秀组独占缓存下限"><span>%</span></div></div>' +
+          '<div class="setting-row setting-row-input"><div><strong>独占平均首字时间上限</strong><span>按配置周期计算的平均首字时间超过此值时退出独占。</span></div><div class="unit-input"><input data-field="elite-ttft-maximum" type="number" min="1" max="3600000" step="1" aria-label="优秀组独占首字时间上限"><span>ms</span></div></div>' +
+          '<p class="rule-footnote">独占仅保留倍率最低的合格账号。达到判断所需样本后，触发任一质量条件即按本组普通规则继续调用。</p>' : ''}
         ${group.alwaysOn ? '<p class="rule-footnote">常开组和当前普通调用组可同时开启，不因质量指标停用。立即尝试清除宿主限流、过载或临时不可调度标记；持续或反复失败则退避。宿主账号错误需人工处理，不会自动清除。</p>' : ''}`;
       const ruleDefaults = defaultRule(group.id);
-      const fieldDefaults = { priority: group.priority, 'retry-seconds': ruleDefaults.cooldown_seconds, 'min-input-tokens': ruleDefaults.min_input_tokens,
+      const fieldDefaults = { priority: group.priority, 'retry-seconds': ruleDefaults.cooldown_seconds, 'min-input-tokens': ruleDefaults.min_input_tokens, 'ttft-periods': ruleDefaults.first_token_periods,
         'rate-enabled': true, 'rate-maximum': ruleDefaults.max_rate_multiplier,
         'cache-enabled': true, 'cache-minimum': ruleDefaults.min_cache_ratio * 100,
         'ttft-enabled': true, 'ttft-maximum': ruleDefaults.max_average_first_token_ms,
@@ -158,6 +160,7 @@
       set('retry-seconds', rule.cooldown_seconds);
       set('min-input-tokens', rule.min_input_tokens);
       if (group.alwaysOn) return card;
+      set('ttft-periods', rule.first_token_periods);
       set('rate-enabled', rule.max_rate_multiplier > 0);
       set('rate-maximum', rule.max_rate_multiplier || .2);
       set('cache-enabled', rule.min_cache_ratio > 0);
@@ -181,7 +184,7 @@
   function updateRuleInputs() {
     for (const card of document.querySelectorAll('[data-rule-group]')) {
       const field = (name) => card.querySelector(`[data-field="${name}"]`);
-      for (const [enabled, input] of [['rate-enabled', 'rate-maximum'], ['cache-enabled', 'cache-minimum'], ['ttft-enabled', 'ttft-maximum'], ['elite-enabled', 'elite-minimum'], ['elite-enabled', 'elite-cache-minimum'], ['elite-enabled', 'elite-ttft-maximum']]) {
+      for (const [enabled, input] of [['rate-enabled', 'rate-maximum'], ['cache-enabled', 'cache-minimum'], ['ttft-enabled', 'ttft-maximum'], ['ttft-enabled', 'ttft-periods'], ['elite-enabled', 'elite-minimum'], ['elite-enabled', 'elite-cache-minimum'], ['elite-enabled', 'elite-ttft-maximum']]) {
         if (field(input)) field(input).disabled = !configLoaded || busy || !runtimeReady || automationEnabled || !field(enabled).checked;
       }
       for (const input of card.querySelectorAll('[data-field]')) {
@@ -200,6 +203,7 @@
       const field = (name) => card.querySelector(`[data-field="${name}"]`);
       const fields = ['priority', 'retry-seconds', 'min-input-tokens'];
       if (group !== 'always_on') fields.push('trigger-samples', 'recovery-samples', 'confirmation-seconds', 'recovery-seconds');
+      if (group !== 'always_on') fields.push('ttft-periods');
       if (field('rate-enabled')?.checked) fields.push('rate-maximum');
       if (field('cache-enabled')?.checked) fields.push('cache-minimum');
       if (field('ttft-enabled')?.checked) fields.push('ttft-maximum');
@@ -209,6 +213,7 @@
       priorities[group] = Number(field('priority').value);
       rules[group] = { ...currentRule(group), cooldown_seconds: Number(field('retry-seconds').value), min_input_tokens: Number(field('min-input-tokens').value) };
       if (group === 'always_on') continue;
+      rules[group].first_token_periods = Number(field('ttft-periods').value);
       Object.assign(rules[group], { max_rate_multiplier: field('rate-enabled').checked ? Number(field('rate-maximum').value) : 0, action: 'pause',
         min_cache_ratio: field('cache-enabled').checked ? Number(field('cache-minimum').value) / 100 : 0,
         max_average_first_token_ms: field('ttft-enabled').checked ? Number(field('ttft-maximum').value) : 0,
@@ -534,24 +539,36 @@
     row.className = 'monitor-history-row';
     row.dataset.historyAccountId = account.id;
     row.dataset.period = String(position);
-    const cells = makeMonitorPeriodCacheCell(account, collecting, window, position);
-    cells.push(makeMonitorWindowSampleCell(account, collecting, window));
-    cells.push(makeMonitorWindowTTFTCell(account, collecting, window));
-    cells.push(document.createElement('td'));
-    row.append(document.createElement('td'), document.createElement('td'), document.createElement('td'), ...cells);
+    row.append(document.createElement('td'), document.createElement('td'), document.createElement('td'),
+      makeMonitorPeriodCell(position), makeMonitorPeriodCacheCell(account, collecting, window),
+      makeMonitorWindowTTFTCell(account, collecting, window), document.createElement('td'));
     return row;
+  }
+
+  function makeMonitorPeriodCell(position) {
+    const periodCell = document.createElement('td');
+    periodCell.className = 'monitor-period-cell';
+    const label = document.createElement('strong');
+    label.className = 'monitor-window-label';
+    label.textContent = `周期 ${position}`;
+    periodCell.append(label);
+    if (position === 1) {
+      const toggle = document.createElement('button');
+      toggle.type = 'button';
+      toggle.className = 'monitor-history-toggle';
+      toggle.textContent = '展开周期 2、3';
+      toggle.setAttribute('aria-expanded', 'false');
+      periodCell.append(toggle);
+    }
+    return periodCell;
   }
 
   function makeMonitorPeriodCacheCell(account, collecting, window, position) {
     const rule = currentRule(account.group, account.platform);
     const cacheCell = document.createElement('td');
-    cacheCell.className = 'monitor-window-cache monitor-period-cache';
+    cacheCell.className = 'monitor-window-cache';
     const cache = document.createElement('div');
     cache.className = 'monitor-cache';
-    const label = document.createElement('strong');
-    label.className = 'monitor-window-label';
-    label.textContent = `周期 ${position}`;
-    cache.append(label);
     const cacheValue = document.createElement('strong');
     const ratio = Number.isFinite(window?.cache_ratio) ? window.cache_ratio * 100 : null;
     cacheValue.textContent = collecting && Number.isFinite(ratio) ? `${ratio.toFixed(1)}%` : '—';
@@ -565,17 +582,12 @@
       cache.append(meter);
     } else cache.classList.add('unknown');
     cacheCell.append(cache);
-    const toggle = document.createElement('button');
-    toggle.type = 'button';
-    toggle.className = 'monitor-history-toggle';
-    toggle.textContent = '展开周期 2、3';
-    toggle.setAttribute('aria-expanded', 'false');
-    if (position === 1) cache.append(toggle);
-    return [cacheCell];
+    if (collecting) cacheCell.append(makeMonitorWindowSampleCell(account, collecting, window));
+    return cacheCell;
   }
 
   function makeMonitorWindowSampleCell(account, collecting, window) {
-    const sampleCell = document.createElement('td');
+    const sampleCell = document.createElement('div');
     sampleCell.className = 'monitor-sample monitor-window-sample';
     const sampleCount = Number(window?.requests) || 0;
     const valid = document.createElement('span');
@@ -624,7 +636,7 @@
       group_wait: '等待前序组', exclusive_wait: '独占等待', unavailable: '宿主不可用', needs_rate: '等待倍率', pending: '异常确认中',
       deprioritize: '降低优先级', restored: '恢复调用', manual_change: '检测人工变更', skipped: '跳过动作',
       temporary_retry: '临时异常重试', account_error: '账号异常', account_repaired: '人工修复', recovery_wait: '等待恢复',
-      recovery_trial: '恢复试运行', recovering: '恢复中', recovered: '恢复通过', policy_wait: '策略等待',
+      recovery_trial: '恢复试运行', recovering: '恢复中', recovered: '恢复通过', fallback: '托底恢复', policy_wait: '策略等待',
       manually_disabled: '手动停用', observing: '采样观察', unknown: '状态未知' };
     const badge = document.createElement('span');
     badge.className = 'event-action';
@@ -810,11 +822,17 @@
     const collecting = automationEnabled && samplingActive;
     const rule = currentRule(account.group, account.platform);
     const cache = Number.isFinite(account.cache) ? `${account.cache.toFixed(1)}%` : '—';
-    const cacheMean = Number.isFinite(account.cache) && account.complete && account.calls === qualityWindowSize ? `原始窗口值 · 判断均值${qualityAverageSize}` : '';
-    $('runtime-detail-cache').textContent = !collecting ? '未采集' : `${cache} · ${account.calls || 0} 次${cacheMean}`;
+    $('runtime-detail-cache').textContent = !collecting ? '未采集' : `${cache} · ${account.calls || 0} 次`;
     const ttftLimit = account.firstTokenLimitReached ? ' · 已达 5000 条扫描上限' : '';
-    $('runtime-detail-ttft').textContent = !collecting ? '未采集' : Number.isFinite(account.averageFirstTokenMs) && account.firstTokenSamples >= qualityWindowSize
-      ? `${Math.round(account.averageFirstTokenMs)} ms · 原始窗口值 · 判断均值${qualityAverageSize}${ttftLimit}` : `样本不足 · ${account.firstTokenSamples || 0} / ${qualityWindowSize}${ttftLimit}`;
+    const ttftPeriods = account.firstTokenPeriods || rule.first_token_periods || 5;
+    const ttftWindows = Number.isInteger(account.firstTokenWindows) ? account.firstTokenWindows : null;
+    const ttftPeriodProgress = ttftWindows === null ? '' : ` · 周期 ${ttftWindows} / ${ttftPeriods}`;
+    const ttftSamples = Number.isInteger(account.firstTokenPeriodSamples) ? account.firstTokenPeriodSamples : account.firstTokenSamples;
+    const ttftSampleProgress = `${ttftSamples || 0} / ${qualityWindowSize * (ttftWindows === null ? 1 : ttftPeriods)}`;
+    const decisionAverage = Number.isFinite(account.firstTokenPeriodAverageMs) ? account.firstTokenPeriodAverageMs : account.averageFirstTokenMs;
+    const ttftReady = Number.isFinite(decisionAverage) && (ttftWindows === null ? account.firstTokenSamples >= qualityWindowSize : ttftWindows >= ttftPeriods);
+    $('runtime-detail-ttft').textContent = !collecting ? '未采集' : ttftReady
+      ? `${Math.round(decisionAverage)} ms${ttftWindows === null ? ` · 原始窗口值 · 判断均值${qualityAverageSize}` : ` · ${ttftSampleProgress} · 判断周期${ttftPeriods}`}${ttftLimit}` : `样本不足 · ${ttftSampleProgress}${ttftPeriodProgress}${ttftLimit}`;
     setText('runtime-detail-filter', collecting ? `≥${tokenMinimum(account.minimumInputTokens ?? rule.min_input_tokens)} Token` : '未采集');
     const reason = collecting ? account.reason || account.availability : '';
     $('runtime-detail-reason').textContent = reason || '当前状态没有异常说明。';
@@ -1171,6 +1189,13 @@
     $('overview-callable').textContent = String(callable);
     $('overview-exception').textContent = String(exceptions);
     $('overview-needs-rate').textContent = String(needsRate);
+    const labels = { stable: '稳定', frequent_switch: '频繁切换', anomaly_detected: '检测到异常', unavailable: '无可调用账号', idle: '未启动', standby: '待机', error: '运行异常', unknown: '待确认' };
+    const overall = $('overview-state');
+    if (overall) {
+      overall.textContent = labels[overallMonitoring.state] || '待确认';
+      overall.title = overallMonitoring.reason || '';
+    }
+    setText('overview-reason', overallMonitoring.reason || '');
   }
 
   function renderRouteOrder(monitoredGroups) {
@@ -1332,6 +1357,7 @@
   }
   function clearAccountSession(account) {
     return { ...account, calls: 0, cache: null, complete: false, firstTokenSamples: 0,
+      firstTokenWindows: 0, firstTokenPeriods: 5,
       minimumInputTokens: null, excludedSmall: null, excludedUnknown: null,
       averageFirstTokenMs: null, firstTokenLimitReached: false, diagnostics: null,
       state: account.state === 'unsupported' ? 'unsupported' : 'observing', status: 'ready',
@@ -1472,6 +1498,10 @@
       excludedUnknown: samplingActive && Number.isInteger(raw.excluded_unknown_requests) && raw.excluded_unknown_requests >= 0 ? raw.excluded_unknown_requests : null,
       rateMode: shownMode, reason: samplingActive ? safeText(raw.reason, '') : '',
       averageFirstTokenMs: samplingActive && Number.isFinite(raw.average_first_token_ms) ? raw.average_first_token_ms : null, firstTokenSamples: samplingActive ? Number(raw.first_token_samples) || 0 : 0,
+      firstTokenWindows: samplingActive && Number.isInteger(raw.first_token_windows) ? raw.first_token_windows : null,
+      firstTokenPeriods: samplingActive ? Number(raw.first_token_periods) || 5 : 5,
+      firstTokenPeriodAverageMs: samplingActive && Number.isFinite(raw.first_token_period_average_ms) ? raw.first_token_period_average_ms : null,
+      firstTokenPeriodSamples: samplingActive && Number.isInteger(raw.first_token_period_samples) ? raw.first_token_period_samples : null,
       firstTokenLimitReached: samplingActive && raw.first_token_limit_reached === true,
       state, schedulable: raw.schedulable, priority: Number.isFinite(raw.priority) ? raw.priority : null,
       syncError: automationEnabled && !resetSessionPending && (samplingActive || raw.state === 'unknown' && raw.read_ok === false) ? safeText(raw.error, '') : '',
@@ -1494,6 +1524,7 @@
     let snapshot;
     try { snapshot = JSON.parse(result.status_json || '{}'); } catch (_) { throw new Error('运行快照无法解析。'); }
     runtimeHostname = typeof snapshot.hostname === 'string' ? snapshot.hostname : runtimeHostname;
+    overallMonitoring = { state: safeText(snapshot.overall_state, 'unknown'), reason: safeText(snapshot.overall_reason, '') };
     runtimeReady = typeof snapshot.version === 'string' && snapshot.version !== '';
     const wasResetPending = resetSessionPending;
     const wasSampling = samplingActive;
@@ -1516,7 +1547,7 @@
       const account = raw ? normalizeAccount(raw, previous, settingByID.get(id))
         : previous ? (sessionChanged || !samplingActive ? clearAccountSession(previous) : previous)
         : { id, name: `账号 ${id}`, platform: 'unknown', group: 'temporary', status: 'ready', fixedRate: 1, accountRate: null,
-          upstreamRate: null, cache: null, calls: 0, letter: id.slice(-2), rateMode: 'fixed' };
+          upstreamRate: null, cache: null, calls: 0, firstTokenWindows: 0, firstTokenPeriods: 5, letter: id.slice(-2), rateMode: 'fixed' };
       // Row handlers keep the account reference while the account data stays the same.
       return sameData(previous, account) ? previous : account;
     });
@@ -1539,6 +1570,7 @@
     } else if (eventsChanged && $('runtime-detail-dialog').open) {
       renderAccountEvents({ id: detailAccountId });
     }
+    renderAccountOverview(visibleAccounts());
     updateAddAccountControls();
   }
   async function refreshStatus() {

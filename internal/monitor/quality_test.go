@@ -37,6 +37,43 @@ func configureQuality(c *config.Config, group string, minRatio, maxTTFT float64)
 	c.GroupRules[group] = rule
 }
 
+func TestQualityHistoryEvaluatesTTFTPerWindow(t *testing.T) {
+	rule := config.Defaults().GroupRules["general"]
+	rule.MinCacheRatio, rule.MaxAverageFirstTokenMs, rule.FirstTokenPeriods = .8, 1000, 5
+	ttft := 100.0
+	window := qualityWindow(time.Date(2026, 11, 18, 12, 1, 0, 0, time.UTC), 1, "m", "stream", .9)
+	window.AverageFirstTokenMs, window.FirstTokenSamples = &ttft, config.QualityWindowRequests
+	store := &memoryStore{}
+	item := &managedAccount{
+		row:            AccountStatus{ID: 7},
+		history:        &accountQualityHistory{AdminURL: "admin", Executor: "node", SamplingSince: time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC), Scope: accountQualityScope},
+		qualityWindows: []adminapi.QualityWindow{window},
+	}
+	writeQualityHistory(context.Background(), store, item, rule, windowTime(window))
+	if item.history == nil || len(item.history.History) != 1 || item.history.History[0].Result != "healthy" {
+		t.Fatalf("single history window was incorrectly gated by the five-period TTFT setting: %+v", item.history)
+	}
+}
+
+func TestPolicyComparisonMigratesMissingTTFTPeriodsButDetectsChanges(t *testing.T) {
+	current := config.Defaults().GroupRules["general"]
+	legacy := current
+	legacy.FirstTokenPeriods = 0
+	if policyDiffersForHealth(legacy, current) {
+		t.Fatal("missing legacy TTFT periods were treated as an edited quality policy")
+	}
+	previous := current
+	current.FirstTokenPeriods--
+	if !policyDiffersForHealth(previous, current) {
+		t.Fatal("an explicit TTFT period change was ignored")
+	}
+}
+
+func windowTime(window adminapi.QualityWindow) time.Time {
+	at, _, _ := adminapi.ParseSampleKey(window.LastSample)
+	return at
+}
+
 func restartMonitor(t *testing.T, e *Engine, c config.Config, store *memoryStore, at time.Time) *Engine {
 	t.Helper()
 	restarted := New("test", "node-a")
@@ -89,10 +126,9 @@ func TestQualityWindowsPreserveWarmupAndAccountWideConfirmation(t *testing.T) {
 		t.Fatalf("account bad streak did not combine both models, or took action too early: %+v", s)
 	}
 	qualityCycle(e, api, at(360), 7)
-	if !api.accounts[7].Schedulable {
-		t.Fatal("an unchanged sample confirmed a fault")
+	if api.accounts[7].Schedulable {
+		t.Fatal("a successful known scan after the dwell did not confirm the pending fault")
 	}
-	qualityCycle(e, api, at(360), 7, bad(360, 520, "c", "ws_v2"))
 	record := ledgerOf(t, store).Records["7"]
 	if api.accounts[7].Schedulable || record.FailureKind != "quality" || record.FailureCount != 1 ||
 		record.HoldUntil == nil || !record.HoldUntil.Equal(at(660)) {
@@ -444,7 +480,8 @@ func setupHTTPQuality(t *testing.T, ratio, ttft float64) (*Engine, config.Config
 	func(int, time.Time, string, string, string), func()) {
 	t.Helper()
 	a := account(7, "openai", "apikey", 8, true)
-	_, c, _, store, now := setup(t, a)
+	_, c, _, _, now := setup(t, a)
+	store := &memoryStore{}
 	c.UpstreamRatesEnabled = false
 	configureQuality(&c, "general", ratio, ttft)
 	var mu sync.Mutex
@@ -510,7 +547,7 @@ func setupHTTPQuality(t *testing.T, ratio, ttft float64) (*Engine, config.Config
 			case "boundary-low":
 				input, read = 20000, 20000
 			case "boundary-mid":
-				input, read = 12000, 28000
+				input, read = 11200, 28800
 			case "boundary-high":
 				input, read = 4000, 36000
 			case "boundary-top":
@@ -563,6 +600,23 @@ func TestHTTPQualityAtExactCacheBoundaryKeepsExcellentExclusivity(t *testing.T) 
 			len(row.QualitySampling.History) != i || row.QualitySampling.History[0].Result != "healthy" {
 			t.Fatalf("an exact cache boundary or discarded TTFT spike changed scheduling: row=%+v sampling=%+v", row, row.QualitySampling)
 		}
+	}
+}
+
+func TestCachePolicyMigrationPreservesObservationCursorAndHold(t *testing.T) {
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	first := qualityWindow(now, 1, "a", "sync", .7)
+	observed := qualityWindow(now, 21, "a", "sync", .7)
+	hold := now.Add(time.Hour)
+	record := &ActionRecord{
+		QualityScope: "account-trimmed-v2", LastQualityWindow: first.LastSample,
+		FirstTokenThrough: observed.LastSample, BadWindows: 1,
+		FailureKind: "quality", FailureCount: 2, HoldUntil: &hold,
+	}
+	migrateQualityWindow(record)
+	if record.QualityScope != accountQualityScope || record.QualityLegacyAnchor != observed.LastSample ||
+		freshQualityWindow(observed, record.QualityLegacyAnchor) || record.BadWindows != 0 || record.HoldUntil != &hold || record.FailureCount != 2 {
+		t.Fatalf("cache policy migration lost a hold or reused old quality evidence: %+v", record)
 	}
 }
 
@@ -669,7 +723,7 @@ func TestHTTPQualitySealsConsecutiveWindowsAndShowsTrailingCalls(t *testing.T) {
 		h.CacheRatio == nil || *h.CacheRatio != .7 ||
 		h.AverageFirstTokenMs == nil || *h.AverageFirstTokenMs != 210 ||
 		h.Result != "abnormal" || h.ExcludedSmallRequests != 1 || b.BadWindows != 1 {
-		t.Fatalf("incorrect trimmed window and model details: %+v", h)
+		t.Fatalf("incorrect window metrics and model details: %+v", h)
 	}
 
 	add(1, at.Add(time.Second), "unknown", "a", "sync")

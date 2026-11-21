@@ -64,7 +64,7 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			migrateQualityWindow(r)
 			if r.Action != "schedule" {
 				item.restoring = true
-				if r.Phase == "pending_restore" && matchesOriginal(a, r) {
+				if r.Phase == "pending_restore" && r.PendingField == "" && matchesOriginal(a, r) {
 					delete(ledger.Records, key)
 					item.record = nil
 					continue
@@ -119,7 +119,7 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			!sampleAfter(retry.Through, item.history.LastSample) && item.history.LastSample != "" {
 			r.QualityHistoryRetry = nil
 		}
-		if r.Group != item.setting.Group || r.Platform != a.Platform || r.Policy != rule {
+		if r.Group != item.setting.Group || r.Platform != a.Platform || policyDiffersForHealth(r.Policy, rule) {
 			resetHealth(r)
 			r.SampleSince = &now
 		}
@@ -136,6 +136,10 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			continue
 		}
 		if a.Status == "error" {
+			if c.AutomationEnabled && r.FallbackPending && r.PendingField == "" {
+				r.FallbackPending = false
+				triggerFallback(ledger, item, now)
+			}
 			markAccountFault(item, a, now)
 			continue
 		}
@@ -149,6 +153,12 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			r.HoldUntil = &now
 			row.clearUsage()
 			logEvent(ledger, a.ID, a.Name, "account_repaired", "宿主账号已由人工修复，排队验证恢复", now)
+		}
+		if c.AutomationEnabled && r.FallbackPending && r.PendingField == "" && a.Schedulable && a.Active(now) {
+			r.FallbackPending = false
+			triggerFallback(ledger, item, now)
+			startTrial(item, ledger.SamplingSince, now, rule)
+			logEvent(ledger, a.ID, a.Name, "fallback", ledger.FallbackReason, now)
 		}
 		// Temporary host flags still gate requests at the host. A failed clear
 		// must not turn off the always-on scheduling switch as well.
@@ -176,6 +186,9 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			// This group is independent of the four ordinary failover groups.
 			if temp != "" {
 				if err := e.clearTemporary(ctx, api, store, ledger, item, now); err != nil {
+					if errors.Is(err, errManagementPersistence) {
+						return err
+					}
 					if !r.AccountFault {
 						retryFailed(r, err.Error(), now, rule)
 						row.State, row.Reason, row.RecoveryAt = "temporary_retry", r.Reason, r.HoldUntil
@@ -186,10 +199,8 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 				}
 				a = item.account
 				r.HoldUntil, r.LastTemporaryState = nil, ""
-				startTrial(item, ledger.SamplingSince, now, rule)
 			} else if r.HoldUntil != nil {
 				r.HoldUntil = nil
-				startTrial(item, ledger.SamplingSince, now, rule)
 			}
 			if r.RecoveryTrial && r.RecoveryStartedAt != nil && now.Sub(*r.RecoveryStartedAt) >= time.Duration(recoverySeconds(rule))*time.Second && row.Complete && row.Requests == config.QualityWindowRequests {
 				finishRecovery(r)
@@ -211,10 +222,13 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			continue
 		}
 		if r.HoldUntil != nil || r.RecoveryTrial || r.FailureKind != "" {
-			r.RecoveryTrial = true
 			item.candidate = true
 			row.State, row.Reason = "recovery_wait", "已到恢复时间，等待前序组恢复尝试；使用原组优先级"
 			// A running trial cannot reuse observations from before it opened.
+			if r.RecoveryStartedAt != nil && !a.Schedulable {
+				// A previous version started the clock before the open was confirmed.
+				r.RecoveryStartedAt, r.RecoveryDeadline = nil, nil
+			}
 			if r.RecoveryStartedAt != nil {
 				failed, healthy := evaluateQuality(r, item, rule, now, true)
 				if failed {
@@ -276,6 +290,14 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 			selectWinner(winners, a.Platform, groupRank(item.setting.Group))
 		}
 	}
+	var fallback *managedAccount
+	if c.AutomationEnabled && !ledger.FallbackTriggered {
+		fallback = fallbackCandidate(items, winners, candidates, unknownPlatforms, now)
+	}
+	if fallback != nil {
+		fallback.candidate, fallback.eligible = true, true
+		candidates[fallback.account.Platform] = fallback
+	}
 	exclusive := map[string]*managedAccount{}
 	for _, item := range items {
 		if !item.eligible || item.candidate || item.setting.Group != "excellent" {
@@ -314,9 +336,16 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 				item.row.Reason = "原组优先级未高于后备组，请停止监控后调整组优先级再恢复"
 				continue
 			}
+			if item == fallback {
+				item.schedulable = true
+				continue
+			}
 			if item.record.RecoveryStartedAt == nil {
 				if item.account.TemporaryUnavailableReason(now) != "" {
 					if err := e.clearTemporary(ctx, api, store, ledger, item, now); err != nil {
+						if errors.Is(err, errManagementPersistence) {
+							return err
+						}
 						if !item.record.AccountFault {
 							retryFailed(item.record, err.Error(), now, item.record.Policy)
 							item.row.State, item.row.Reason, item.row.RecoveryAt = "temporary_retry", item.record.Reason, item.record.HoldUntil
@@ -324,15 +353,13 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 						item.row.Error = joinError(item.row.Error, err.Error())
 						continue
 					}
-				} else {
-					item.record.RecoveryAttempts++
-					item.record.LastRecoveryAttempt = now
+					item.record.HoldUntil, item.record.LastTemporaryState = nil, ""
 				}
-				startTrial(item, ledger.SamplingSince, now, item.record.Policy)
-				logEvent(ledger, item.row.ID, item.row.Name, "recovery_trial", "开始按原组优先级恢复试运行，后备组保持开启", now)
 			}
 			item.schedulable = true
-			item.row.State, item.row.Reason = "recovering", fmt.Sprintf("原组优先级 %d 恢复试运行；健康窗口 %d / %d；后备组保持开启", item.priority, item.record.GoodWindows, recoveryWindows(item.record.Policy))
+			if item.record.RecoveryStartedAt != nil {
+				setRecoveryStatus(item)
+			}
 			continue
 		}
 		if !hasWinner || groupRank(item.setting.Group) != winner {
@@ -352,26 +379,35 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 		return err
 	}
 	ordered := append([]*managedAccount{}, items...)
-	sort.SliceStable(ordered, func(i, j int) bool { return !ordered[i].schedulable && ordered[j].schedulable })
-	blockedOpens := map[string]bool{}
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return ordered[i].schedulable && !ordered[j].schedulable
+	})
+	blockedTransitions := map[string]bool{}
 	for _, item := range ordered {
 		r := item.record
 		if !item.readOK || item.account.Type != "apikey" || r == nil || r.Phase == "manual_change" {
 			continue
 		}
-		if !item.restoring && item.setting.Group != "always_on" && item.schedulable &&
-			!item.account.Schedulable && blockedOpens[item.account.Platform] {
-			item.row.State, item.row.Reason = "group_wait", "前序账号关闭尚未确认，等待下次核对后再开放调度"
+		if !item.restoring && r.AccountFault && item.account.Status == "error" {
+			continue // A confirmed host error already prevents routing.
+		}
+		if !item.restoring && !item.schedulable && item.account.Schedulable && blockedTransitions[item.account.Platform] {
+			item.row.State, item.row.Reason = "group_wait", "后备账号开启未确认，暂时保留当前调度"
 			updateRecordStatus(ledger, item, now)
 			continue
 		}
-		if err := e.syncSchedule(ctx, api, store, ledger, item); err != nil {
+		if err := e.syncSchedule(ctx, api, store, ledger, item, item == fallback, now); err != nil {
+			if errors.Is(err, errManagementPersistence) {
+				return err
+			}
 			item.row.Error = joinError(item.row.Error, err.Error())
-			if !item.schedulable && !item.restoring && item.setting.Group != "always_on" &&
-				(item.account.Schedulable || r.TargetSchedulable || r.PendingField == "schedulable") {
-				blockedOpens[item.account.Platform] = true
+			if item.schedulable && !item.restoring && item.setting.Group != "always_on" {
+				blockedTransitions[item.account.Platform] = true
 			}
 			updateRecordStatus(ledger, item, now)
+			if item == fallback {
+				return err
+			}
 			continue
 		}
 		if item.restoring {
@@ -382,8 +418,35 @@ func (e *Engine) schedule(ctx context.Context, api API, store Store, ledger *Led
 		} else {
 			updateRecordStatus(ledger, item, now)
 		}
+		if c.AutomationEnabled && !item.restoring && item.schedulable && item.account.Schedulable &&
+			item.record.FailureKind != "" && item.record.RecoveryStartedAt == nil &&
+			(item == fallback || item.record.HoldUntil == nil || !now.Before(*item.record.HoldUntil)) {
+			rowReason := "开始按原组优先级恢复试运行，后备组保持开启"
+			if item == fallback {
+				triggerFallback(ledger, item, now)
+				rowReason = ledger.FallbackReason
+			} else {
+				item.record.RecoveryAttempts++
+				item.record.LastRecoveryAttempt = now
+			}
+			item.record.FallbackPending = false
+			startTrial(item, ledger.SamplingSince, now, item.record.Policy)
+			logEvent(ledger, item.row.ID, item.row.Name, "recovery_trial", rowReason, now)
+			setRecoveryStatus(item)
+			updateRecordStatus(ledger, item, now)
+		}
 		if err := save(ctx, store, ledger); err != nil {
 			return err
+		}
+	}
+	if c.AutomationEnabled {
+		for _, item := range items {
+			if r := item.record; r != nil && item.row.quality != nil && item.row.quality.WindowKnown {
+				// Keep observational windows even during warmup and in the always-on group.
+				for _, window := range item.qualityWindows {
+					appendFirstTokenWindow(r, window)
+				}
+			}
 		}
 	}
 	return save(ctx, store, ledger)
@@ -406,6 +469,194 @@ func selectWinner(winners map[string]int, platform string, rank int) {
 		winners[platform] = rank
 	}
 }
+
+const frequentSwitchThreshold = 3
+
+func reserveAccountFailed(item *managedAccount) bool {
+	if item.setting.Group != "reserve" || !item.readOK || !item.selected || item.account.Type != "apikey" ||
+		item.restoring || (item.setting.DesiredSchedulable != nil && !*item.setting.DesiredSchedulable) ||
+		(item.record != nil && item.record.Phase == "manual_change") {
+		return false
+	}
+	if item.record != nil && item.record.AccountFault {
+		return true
+	}
+	switch item.row.State {
+	case "account_error", "paused", "deprioritized", "temporary_retry", "unavailable":
+		return true
+	default:
+		return item.record != nil && item.record.FailureKind != "" && item.record.HoldUntil != nil
+	}
+}
+
+func fallbackCandidate(items []*managedAccount, winners map[string]int, recoveryCandidates map[string]*managedAccount,
+	unknownPlatforms map[string]bool, now time.Time) *managedAccount {
+	for _, item := range items {
+		if item.record == nil || !item.record.FallbackPending {
+			continue
+		}
+		platform := item.account.Platform
+		if !selectedCallAccount(item) || unknownPlatforms[platform] || unknownPlatforms["*"] ||
+			item.record.AccountFault || item.row.Error != "" || !item.account.Active(now) ||
+			(item.record.Policy.MaxRateMultiplier > 0 && (item.row.EffectiveRate == nil || *item.row.EffectiveRate > item.record.Policy.MaxRateMultiplier)) {
+			return nil
+		}
+		return item
+	}
+	tailRanks := map[string]int{}
+	for _, item := range items {
+		if !selectedCallAccount(item) {
+			continue
+		}
+		if groupRank(item.setting.Group) > tailRanks[item.account.Platform] {
+			tailRanks[item.account.Platform] = groupRank(item.setting.Group)
+		}
+	}
+	reserveFailed := map[string]bool{}
+	for _, item := range items {
+		if selectedCallAccount(item) && groupRank(item.setting.Group) == tailRanks[item.account.Platform] && accountFailed(item) {
+			reserveFailed[item.account.Platform] = true
+		}
+	}
+	candidates := []*managedAccount{}
+	for _, item := range items {
+		platform := item.account.Platform
+		if !reserveFailed[platform] || unknownPlatforms[platform] || unknownPlatforms["*"] {
+			continue
+		}
+		if _, hasWinner := winners[platform]; hasWinner {
+			continue
+		}
+		if trial := recoveryCandidates[platform]; trial != nil && trial.record != nil && trial.record.RecoveryStartedAt != nil {
+			continue // The platform already has a host-confirmed recovery trial in flight.
+		}
+		if !item.readOK || !item.selected || item.account.Type != "apikey" || item.restoring || item.record == nil ||
+			groupRank(item.setting.Group) >= tailRanks[platform] || item.record.AccountFault || item.record.Phase == "manual_change" ||
+			(item.setting.DesiredSchedulable != nil && !*item.setting.DesiredSchedulable) || !item.account.Active(now) ||
+			item.account.Schedulable || item.record.RecoveryStartedAt != nil || item.row.Error != "" || item.row.EffectiveRate == nil ||
+			(item.record.Policy.MaxRateMultiplier > 0 && *item.row.EffectiveRate > item.record.Policy.MaxRateMultiplier) {
+			continue
+		}
+		if item.record.HoldUntil == nil || !now.Before(*item.record.HoldUntil) {
+			continue
+		}
+		candidates = append(candidates, item)
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		left, right := candidates[i], candidates[j]
+		if groupRank(left.setting.Group) != groupRank(right.setting.Group) {
+			return groupRank(left.setting.Group) < groupRank(right.setting.Group)
+		}
+		if left.priority != right.priority {
+			return left.priority < right.priority
+		}
+		return left.account.ID < right.account.ID
+	})
+	if len(candidates) == 0 {
+		return nil
+	}
+	return candidates[0]
+}
+
+func selectedCallAccount(item *managedAccount) bool {
+	return item.readOK && item.selected && item.account.Type == "apikey" && !item.restoring &&
+		groupRank(item.setting.Group) < len(callGroups) &&
+		(item.setting.DesiredSchedulable == nil || *item.setting.DesiredSchedulable) &&
+		(item.record == nil || item.record.Phase != "manual_change")
+}
+
+func accountFailed(item *managedAccount) bool {
+	if item.record != nil && item.record.AccountFault {
+		return true
+	}
+	switch item.row.State {
+	case "account_error", "paused", "deprioritized", "temporary_retry", "unavailable":
+		return true
+	default:
+		return item.record != nil && item.record.FailureKind != "" && item.record.HoldUntil != nil
+	}
+}
+
+func triggerFallback(ledger *Ledger, item *managedAccount, now time.Time) {
+	ledger.FallbackTriggered = true
+	ledger.FallbackAt = &now
+	ledger.FallbackReason = "备用组账号异常，前序账号尚未恢复，已从最前有效组发起一次托底试运行"
+	item.record.RecoveryAttempts++
+	item.record.LastRecoveryAttempt = now
+	logEvent(ledger, item.row.ID, item.row.Name, "fallback", ledger.FallbackReason, now)
+}
+
+// Switches measure confirmed changes in the preferred ordinary account, not actual requests.
+// Keep this diagnostic out of the host's bounded durable ownership ledger.
+type switchTracker struct {
+	session time.Time
+	winners map[string]int64
+	events  []time.Time
+}
+
+func (s *switchTracker) observe(session time.Time, items []*managedAccount, unknownPlatforms map[string]bool, windowMinutes int, now time.Time) int {
+	if s.winners == nil || !s.session.Equal(session) {
+		*s = switchTracker{session: session, winners: map[string]int64{}}
+	}
+	current := map[string]*managedAccount{}
+	for _, item := range items {
+		if item.selected && item.readOK && item.account.Type == "apikey" && groupRank(item.setting.Group) < len(callGroups) && item.row.Error != "" {
+			unknownPlatforms[item.account.Platform] = true
+		}
+	}
+	for _, item := range items {
+		if !item.readOK || !item.selected || item.account.Type != "apikey" || item.restoring ||
+			groupRank(item.setting.Group) >= len(callGroups) || unknownPlatforms["*"] || unknownPlatforms[item.account.Platform] ||
+			!item.row.Schedulable || !item.account.Active(now) || item.row.Error != "" {
+			continue
+		}
+		old := current[item.account.Platform]
+		if old == nil || item.row.Priority < old.row.Priority ||
+			(item.row.Priority == old.row.Priority && item.account.ID < old.account.ID) {
+			current[item.account.Platform] = item
+		}
+	}
+	for platform, item := range current {
+		previous := s.winners[platform]
+		if previous != 0 && previous != item.account.ID {
+			s.events = append(s.events, now)
+		}
+		s.winners[platform] = item.account.ID
+	}
+	cutoff := now.Add(-time.Duration(max(1, windowMinutes)) * time.Minute)
+	for len(s.events) > 0 && s.events[0].Before(cutoff) {
+		s.events = s.events[1:]
+	}
+	return len(s.events)
+}
+
+func monitoringSummary(ledger *Ledger, c config.Config, items []*managedAccount, switches int, now time.Time) (string, string) {
+	if ledger.FallbackTriggered {
+		return "anomaly_detected", ledger.FallbackReason
+	}
+	callable := false
+	for _, item := range items {
+		if item.selected && item.record != nil && item.record.FallbackPending {
+			return "unknown", "托底调度写入结果待宿主确认"
+		}
+		pendingWrite := item.record != nil && (item.record.PendingField != "" || item.record.Phase == "pending_apply")
+		if item.selected && (!item.readOK || item.row.Error != "" || item.row.State == "account_error" || item.row.State == "manual_change" || pendingWrite) {
+			return "unknown", "部分账号采集或调度未确认"
+		}
+		if item.selected && item.account.Type == "apikey" && item.setting.Group != "temporary" &&
+			item.row.Schedulable && item.account.Active(now) {
+			callable = true
+		}
+	}
+	if !callable {
+		return "unavailable", "没有确认可调用的账号"
+	}
+	if switches >= frequentSwitchThreshold {
+		return "frequent_switch", fmt.Sprintf("最近 %d 分钟主调度账号切换 %d 次", max(1, c.WindowMinutes), switches)
+	}
+	return "stable", fmt.Sprintf("最近 %d 分钟主调度账号切换 %d 次", max(1, c.WindowMinutes), switches)
+}
+
 func triggerWindows(r config.Rule) int  { return max(2, r.TriggerSamples) }
 func recoveryWindows(r config.Rule) int { return max(2, r.RecoverySamples) }
 func confirmationSeconds(r config.Rule) int {
@@ -476,6 +727,11 @@ func startTrial(item *managedAccount, since, now time.Time, rule config.Rule) {
 	resetQualityProgress(r)
 	r.LastQualityWindow = cursor
 	item.row.clearUsage()
+}
+func setRecoveryStatus(item *managedAccount) {
+	item.row.State = "recovering"
+	item.row.Reason = fmt.Sprintf("原组优先级 %d 恢复试运行；健康窗口 %d / %d；后备组保持开启",
+		item.priority, item.record.GoodWindows, recoveryWindows(item.record.Policy))
 }
 func finishRecovery(r *ActionRecord) {
 	r.FailureKind, r.Reason = "", ""
@@ -575,11 +831,11 @@ func (e *Engine) clearTemporary(ctx context.Context, api API, store Store, ledge
 func exclusiveExitReason(rule config.Rule, row AccountStatus) string {
 	if rule.ExclusiveMinCacheRatio > 0 && row.Complete && row.Requests >= config.QualityWindowRequests &&
 		row.CacheRatio != nil && *row.CacheRatio < rule.ExclusiveMinCacheRatio {
-		return fmt.Sprintf("缓存命中比例去极值均值 %.1f%% 低于独占下限 %.1f%%，退出独占并按本组规则调用", *row.CacheRatio*100, rule.ExclusiveMinCacheRatio*100)
+		return fmt.Sprintf("平均缓存命中比例 %.1f%% 低于独占下限 %.1f%%，退出独占并按本组规则调用", *row.CacheRatio*100, rule.ExclusiveMinCacheRatio*100)
 	}
-	if rule.ExclusiveMaxAverageFirstTokenMs > 0 && row.AverageFirstTokenMs != nil && row.FirstTokenSamples >= config.QualityWindowRequests &&
-		*row.AverageFirstTokenMs > rule.ExclusiveMaxAverageFirstTokenMs {
-		return fmt.Sprintf("最近 %d 次首字时间去极值均值 %.0f ms 超过独占上限 %.0f ms，退出独占并按本组规则调用", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.ExclusiveMaxAverageFirstTokenMs)
+	if rule.ExclusiveMaxAverageFirstTokenMs > 0 && row.FirstTokenPeriodAverage != nil && row.FirstTokenWindows >= firstTokenPeriods(rule) &&
+		*row.FirstTokenPeriodAverage > rule.ExclusiveMaxAverageFirstTokenMs {
+		return fmt.Sprintf("最近 %d 个首字时间周期均值 %.0f ms 超过独占上限 %.0f ms，退出独占并按本组规则调用", firstTokenPeriods(rule), *row.FirstTokenPeriodAverage, rule.ExclusiveMaxAverageFirstTokenMs)
 	}
 	return ""
 }
@@ -603,9 +859,6 @@ func reconcileOwned(a adminapi.Account, r *ActionRecord) bool {
 		}
 		return true
 	}
-	if a.Priority == r.TargetPriority && a.Schedulable == r.TargetSchedulable {
-		return true
-	}
 	switch r.PendingField {
 	case "priority":
 		if a.Priority == r.PendingPriority && a.Schedulable == r.TargetSchedulable {
@@ -618,14 +871,29 @@ func reconcileOwned(a adminapi.Account, r *ActionRecord) bool {
 			return true
 		}
 	}
+	if a.Priority == r.TargetPriority && a.Schedulable == r.TargetSchedulable {
+		return true
+	}
 	return false
 }
 
-func (e *Engine) syncSchedule(ctx context.Context, api API, store Store, ledger *Ledger, item *managedAccount) error {
+func (e *Engine) syncSchedule(ctx context.Context, api API, store Store, ledger *Ledger, item *managedAccount, fallback bool, now time.Time) error {
 	r := item.record
 	fields := []string{"priority", "schedulable"}
 	if !item.schedulable {
 		fields = []string{"schedulable", "priority"}
+	}
+	if r.PendingField != "" {
+		desiredPriority, desiredSchedulable := item.priority, item.schedulable
+		if item.restoring {
+			desiredPriority, desiredSchedulable = r.OriginalPriority, r.OriginalSchedulable
+		}
+		matchesPending := (r.PendingField == "priority" && r.PendingPriority == desiredPriority) ||
+			(r.PendingField == "schedulable" && r.PendingSchedulable == desiredSchedulable)
+		if !matchesPending {
+			return errors.New("上次管理写入尚未确认，等待宿主状态同步后再操作")
+		}
+		fields = []string{r.PendingField}
 	}
 	for _, field := range fields {
 		desiredPriority, desiredSchedulable := item.priority, item.schedulable
@@ -674,6 +942,12 @@ func (e *Engine) syncSchedule(ctx context.Context, api API, store Store, ledger 
 			}
 			if !available || (item.setting.Group != "always_on" && checked.EffectiveRate == nil) {
 				return errors.New("提交前账号或倍率已不可用，取消开放调度")
+			}
+			if item.setting.Group != "always_on" && r.Policy.MaxRateMultiplier > 0 && *checked.EffectiveRate > r.Policy.MaxRateMultiplier {
+				return errors.New("提交前倍率已超过本组上限，取消开放调度")
+			}
+			if fallback {
+				r.FallbackPending = true
 			}
 		}
 		r.PendingField, r.PendingPriority, r.PendingSchedulable = field, desiredPriority, desiredSchedulable
@@ -751,14 +1025,18 @@ func evaluate(rule config.Rule, row AccountStatus) (bad, known bool, reason, sam
 		if !row.Complete || row.CacheRatio == nil || row.Requests < config.QualityWindowRequests {
 			known = false
 		} else if *row.CacheRatio < rule.MinCacheRatio {
-			return true, true, fmt.Sprintf("缓存命中比例去极值均值 %.1f%% 低于本组下限 %.1f%%", *row.CacheRatio*100, rule.MinCacheRatio*100), "cache:" + row.SampleKey
+			return true, true, fmt.Sprintf("平均缓存命中比例 %.1f%% 低于本组下限 %.1f%%", *row.CacheRatio*100, rule.MinCacheRatio*100), "cache:" + row.SampleKey
 		}
 	}
 	if rule.MaxAverageFirstTokenMs > 0 {
-		if row.AverageFirstTokenMs == nil || row.FirstTokenSamples < config.QualityWindowRequests {
+		average := row.FirstTokenPeriodAverage
+		if average == nil {
+			average = row.AverageFirstTokenMs
+		}
+		if average == nil || row.FirstTokenWindows < firstTokenPeriods(rule) {
 			known = false
-		} else if *row.AverageFirstTokenMs > rule.MaxAverageFirstTokenMs {
-			return true, true, fmt.Sprintf("最近 %d 次首字时间去极值均值 %.0f ms 超过本组上限 %.0f ms", config.QualityWindowRequests, *row.AverageFirstTokenMs, rule.MaxAverageFirstTokenMs), "ttft:" + row.FirstTokenSampleKey
+		} else if *average > rule.MaxAverageFirstTokenMs {
+			return true, true, fmt.Sprintf("最近 %d 个首字时间周期均值 %.0f ms 超过本组上限 %.0f ms", firstTokenPeriods(rule), *average, rule.MaxAverageFirstTokenMs), "ttft:" + row.FirstTokenSampleKey
 		}
 	}
 	if !known {

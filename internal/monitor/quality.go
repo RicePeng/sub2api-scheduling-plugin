@@ -13,12 +13,77 @@ import (
 	"sub2api.local/cache-manager/internal/config"
 )
 
-const accountQualityScope = "account-trimmed-v2"
+const accountQualityScope = "account-cache-all-v3"
 const qualityHistoryLimit = 3
 
 type legacyQualityTrack struct {
 	LastSample   string `json:"last_sample,omitempty"`
 	LegacyAnchor string `json:"legacy_anchor,omitempty"`
+}
+
+type firstTokenWindowMetric struct {
+	Average *float64 `json:"ms,omitempty"`
+	Samples int      `json:"n"`
+}
+
+const firstTokenHistoryLimit = 20
+
+func firstTokenPeriods(rule config.Rule) int {
+	if rule.FirstTokenPeriods < 1 {
+		return config.DefaultFirstTokenPeriods
+	}
+	return rule.FirstTokenPeriods
+}
+
+func policyDiffersForHealth(previous, current config.Rule) bool {
+	// FirstTokenPeriods was introduced after the persisted policy format. A
+	// missing legacy field must not clear an active hold during migration.
+	if previous.FirstTokenPeriods == 0 {
+		previous.FirstTokenPeriods = current.FirstTokenPeriods
+	}
+	return config.NormalizeRule(previous) != config.NormalizeRule(current)
+}
+
+func appendFirstTokenWindow(r *ActionRecord, window adminapi.QualityWindow) {
+	if r == nil {
+		return
+	}
+	if !freshQualityWindow(window, latestSample(r.QualityLegacyAnchor, r.FirstTokenThrough)) {
+		return
+	}
+	r.FirstTokenThrough = window.LastSample
+	r.FirstTokenWindows = append(r.FirstTokenWindows, firstTokenWindowMetric{Average: window.AverageFirstTokenMs, Samples: window.FirstTokenSamples})
+	if len(r.FirstTokenWindows) > firstTokenHistoryLimit {
+		r.FirstTokenWindows = r.FirstTokenWindows[len(r.FirstTokenWindows)-firstTokenHistoryLimit:]
+	}
+}
+
+func firstTokenSummary(r *ActionRecord, windows []adminapi.QualityWindow, periods int) (average *float64, samples, count int) {
+	var progress ActionRecord
+	if r != nil {
+		progress.FirstTokenWindows = slices.Clone(r.FirstTokenWindows)
+		progress.FirstTokenThrough, progress.QualityLegacyAnchor = r.FirstTokenThrough, r.QualityLegacyAnchor
+	}
+	for _, window := range windows {
+		appendFirstTokenWindow(&progress, window)
+	}
+	metrics := progress.FirstTokenWindows
+	if len(metrics) > periods {
+		metrics = metrics[len(metrics)-periods:]
+	}
+	var total float64
+	for _, metric := range metrics {
+		samples += metric.Samples
+		if metric.Average != nil && metric.Samples == config.QualityWindowRequests {
+			total += *metric.Average
+			count++
+		}
+	}
+	if count < periods {
+		return nil, samples, count
+	}
+	value := total / float64(count)
+	return &value, samples, count
 }
 
 // Compare timestamps and numeric IDs, not their variable-width encodings.
@@ -46,6 +111,7 @@ func legacyQualityAnchor(r *ActionRecord) string {
 	// from either per-model windows or the previous account window.
 	last := latestSample("", r.QualityLegacyAnchor)
 	last = latestSample(last, r.LastQualityWindow)
+	last = latestSample(last, r.FirstTokenThrough)
 	if r.QualityHistoryRetry != nil {
 		last = latestSample(last, r.QualityHistoryRetry.Through)
 	}
@@ -60,9 +126,11 @@ func legacyQualityAnchor(r *ActionRecord) string {
 }
 
 func resetQualityProgress(r *ActionRecord) {
-	r.BadWindows, r.GoodWindows = 0, 0
+	r.BadWindows, r.GoodWindows, r.ProvisionalGoodWindows = 0, 0, 0
 	r.LastQualityWindow, r.QualityReason = "", ""
 	r.QualityBadSince, r.QualityEvaluatedAt = nil, nil
+	r.FirstTokenWindows = nil
+	r.FirstTokenThrough = ""
 }
 
 func migrateQualityWindow(r *ActionRecord) {
@@ -72,8 +140,6 @@ func migrateQualityWindow(r *ActionRecord) {
 	r.QualityLegacyAnchor = legacyQualityAnchor(r)
 	r.QualityScope, r.QualityTracks = accountQualityScope, nil
 	r.QualityHistoryRetry = nil
-	// Legacy releases omitted some default fields from stored rules.
-	r.Policy = config.NormalizeRule(r.Policy)
 	if r.FailureKind == "" && r.HoldUntil != nil &&
 		(strings.HasPrefix(r.LastBadSample, "cache:") || strings.HasPrefix(r.LastBadSample, "ttft:")) {
 		r.FailureKind = "quality"
@@ -168,11 +234,12 @@ func readQualityHistory(ctx context.Context, store Store, c config.Config, row *
 	return &saved
 }
 
-func qualityMeasurement(rule config.Rule, window adminapi.QualityWindow) (bad, known bool, reason string) {
+func qualityMeasurement(rule config.Rule, window adminapi.QualityWindow, averageFirstTokenMs *float64, firstTokenWindowCount int) (bad, known bool, reason string) {
 	rule.MaxRateMultiplier = 0 // Price policy is evaluated separately by the scheduler.
 	bad, known, reason, _ = evaluate(rule, AccountStatus{Complete: true,
 		Requests: window.Requests, CacheRatio: window.CacheRatio,
-		AverageFirstTokenMs: window.AverageFirstTokenMs, FirstTokenSamples: window.FirstTokenSamples})
+		AverageFirstTokenMs: window.AverageFirstTokenMs, FirstTokenPeriodAverage: averageFirstTokenMs,
+		FirstTokenSamples: window.FirstTokenSamples, FirstTokenWindows: firstTokenWindowCount})
 	return bad, known, reason
 }
 
@@ -199,7 +266,12 @@ func writeQualityHistory(ctx context.Context, store Store, item *managedAccount,
 		}
 		start, _, _ := adminapi.ParseSampleKey(window.FirstSample)
 		end, _, _ := adminapi.ParseSampleKey(window.LastSample)
-		bad, known, reason := qualityMeasurement(rule, window)
+		historyRule := rule
+		// History rows describe one completed window. The account-level
+		// scheduler still uses the configured multi-window TTFT average, while
+		// this diagnostic result evaluates the window's own TTFT sample.
+		historyRule.FirstTokenPeriods = 1
+		bad, known, reason := qualityMeasurement(historyRule, window, window.AverageFirstTokenMs, window.FirstTokenSamples/config.QualityWindowRequests)
 		if rule.MinCacheRatio == 0 && rule.MaxAverageFirstTokenMs == 0 {
 			known, reason = false, "未配置缓存或首字时间质量条件"
 		}
@@ -236,31 +308,56 @@ func evaluateQuality(r *ActionRecord, item *managedAccount, rule config.Rule, no
 		return false, false
 	}
 	freshBad := false
+	freshWindow := false
 	after := latestSample(r.QualityLegacyAnchor, r.LastQualityWindow)
 	for _, window := range item.qualityWindows {
 		if !freshQualityWindow(window, after) {
 			continue
 		}
+		freshWindow = true
+		appendFirstTokenWindow(r, window)
 		after, r.LastQualityWindow, r.QualityEvaluatedAt = window.LastSample, window.LastSample, &now
-		bad, known, reason := qualityMeasurement(rule, window)
+		averageFirstTokenMs, _, firstTokenWindowCount := firstTokenSummary(r, []adminapi.QualityWindow{window}, firstTokenPeriods(rule))
+		bad, known, reason := qualityMeasurement(rule, window, averageFirstTokenMs, firstTokenWindowCount)
+		if !bad && rule.MaxAverageFirstTokenMs > 0 && firstTokenWindowCount < firstTokenPeriods(rule) {
+			if window.FirstTokenSamples != config.QualityWindowRequests || window.AverageFirstTokenMs == nil {
+				known = false
+				reason = fmt.Sprintf("平均首字时间等待 %d 个完整周期，当前 %d 个", firstTokenPeriods(rule), firstTokenWindowCount)
+			} else {
+				// A fully sampled window can provisionally satisfy recovery while
+				// the rolling TTFT average warms up; cache faults still confirm alone.
+				r.QualityReason, freshBad = reason, false
+				if r.BadWindows != 0 {
+					r.BadWindows, r.QualityBadSince = 0, nil
+				}
+				r.ProvisionalGoodWindows++
+				continue
+			}
+		}
 		r.QualityReason, freshBad = reason, known && bad
 		switch {
 		case !known:
 			// An unknown completed window cannot continue either streak.
-			r.BadWindows, r.GoodWindows, r.QualityBadSince = 0, 0, nil
+			r.BadWindows, r.GoodWindows, r.ProvisionalGoodWindows, r.QualityBadSince = 0, 0, 0, nil
 		case bad:
 			if r.BadWindows == 0 {
 				r.QualityBadSince = &now
 			}
-			r.BadWindows, r.GoodWindows = r.BadWindows+1, 0
+			r.BadWindows, r.GoodWindows, r.ProvisionalGoodWindows = r.BadWindows+1, 0, 0
 		default:
 			r.BadWindows, r.GoodWindows, r.QualityBadSince = 0, r.GoodWindows+1, nil
+			r.ProvisionalGoodWindows++
 		}
 	}
-	if freshBad && r.BadWindows >= triggerWindows(rule) && r.QualityBadSince != nil &&
+	if (freshBad || !freshWindow) && r.BadWindows >= triggerWindows(rule) && r.QualityBadSince != nil &&
 		now.Sub(*r.QualityBadSince) >= time.Duration(confirmationSeconds(rule))*time.Second {
 		row.Reason = fmt.Sprintf("%s，账号连续 %d 个不重叠窗口异常", r.QualityReason, r.BadWindows)
 		return true, false
+	}
+	if recovering && rule.MaxAverageFirstTokenMs > 0 && r.ProvisionalGoodWindows >= recoveryWindows(rule) &&
+		row.FirstTokenPeriodAverage != nil && *row.FirstTokenPeriodAverage <= rule.MaxAverageFirstTokenMs &&
+		row.FirstTokenWindows >= firstTokenPeriods(rule) {
+		return false, true
 	}
 	return false, recovering && r.GoodWindows >= recoveryWindows(rule)
 }
@@ -277,7 +374,7 @@ func fillQualityStatus(row *AccountStatus, r *ActionRecord, saved *accountQualit
 		return
 	}
 	status := &QualityStatus{MinInputTokens: row.MinInputTokens,
-		History: []QualityWindowHistory{}, Models: []adminapi.QualityModelUsage{},
+		History: []QualityWindowHistory{}, Models: []adminapi.QualityModelUsage{}, FirstTokenPeriods: row.FirstTokenPeriods,
 		Reason: "未到达已知窗口边界，当前窗口不可确认"}
 	if saved != nil && len(saved.History) != 0 {
 		status.History = saved.History
@@ -285,6 +382,9 @@ func fillQualityStatus(row *AccountStatus, r *ActionRecord, saved *accountQualit
 	if w := row.quality; w != nil {
 		status.Requests, status.FirstTokenSamples, status.CacheRatio, status.AverageFirstTokenMs =
 			w.Requests, w.FirstTokenSamples, w.CacheRatio, w.AverageFirstTokenMs
+		status.FirstTokenPeriodAverage = row.FirstTokenPeriodAverage
+		status.FirstTokenPeriodSamples = row.FirstTokenPeriodSamples
+		status.FirstTokenWindows = row.FirstTokenWindows
 		status.MinInputTokens, status.ExcludedSmallRequests, status.ExcludedUnknownRequests =
 			w.MinInputTokens, w.ExcludedSmallRequests, w.ExcludedUnknownRequests
 		status.WindowKnown, status.Models = w.WindowKnown, modelDetails(w.Models)

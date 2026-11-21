@@ -170,25 +170,15 @@ func (s *qualitySamples) averages() (cache, ttft *float64) {
 	return cache, ttft
 }
 
-func trimEnds(length int) (start, end int) {
-	if length == config.QualityWindowRequests {
-		const trimPerSide = 2
-		return trimPerSide, length - trimPerSide
-	}
-	return 0, length
-}
-
 func qualityCacheAverage(values []*big.Rat) *float64 {
 	if len(values) == 0 {
 		return nil
 	}
-	sort.Slice(values, func(i, j int) bool { return values[i].Cmp(values[j]) < 0 })
-	start, end := trimEnds(len(values))
 	sum := new(big.Rat)
-	for _, value := range values[start:end] {
+	for _, value := range values {
 		sum.Add(sum, value)
 	}
-	mean, _ := new(big.Rat).Quo(sum, big.NewRat(int64(end-start), 1)).Float64()
+	mean, _ := new(big.Rat).Quo(sum, big.NewRat(int64(len(values)), 1)).Float64()
 	return &mean
 }
 
@@ -197,12 +187,14 @@ func qualityAverage(values []int64) *float64 {
 		return nil
 	}
 	sort.Slice(values, func(i, j int) bool { return values[i] < values[j] })
-	start, end := trimEnds(len(values))
+	if len(values) == config.QualityWindowRequests {
+		values = values[2 : len(values)-2]
+	}
 	sum := new(big.Int)
-	for _, value := range values[start:end] {
+	for _, value := range values {
 		sum.Add(sum, big.NewInt(value))
 	}
-	mean, _ := new(big.Rat).SetFrac(sum, big.NewInt(int64(end-start))).Float64()
+	mean, _ := new(big.Rat).SetFrac(sum, big.NewInt(int64(len(values)))).Float64()
 	return &mean
 }
 

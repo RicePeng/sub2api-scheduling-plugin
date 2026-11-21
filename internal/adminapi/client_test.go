@@ -157,7 +157,7 @@ func TestRecentUsageStopsAtSessionBoundaryAndKeepsCacheAtScanLimit(t *testing.T)
 	}
 }
 
-func TestRecentUsageIndependentlyTrimsAccountMetricsAcrossPages(t *testing.T) {
+func TestRecentUsageKeepsAllCacheRatiosAndTrimsTTFTAcrossPages(t *testing.T) {
 	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
 	shared, since := now.Add(-time.Second), now.Add(-2*time.Second)
 	usage := func(id int64, at time.Time, model, requestType string, capacity, cache, ttft int64) Usage {
@@ -172,7 +172,7 @@ func TestRecentUsageIndependentlyTrimsAccountMetricsAcrossPages(t *testing.T) {
 		if id >= 115 && id <= 124 {
 			cache, ttft := int64(75000), int64(300)
 			if id >= 123 {
-				cache = 100000
+				cache = 95000
 			}
 			if id <= 116 {
 				ttft = 0
@@ -223,10 +223,10 @@ func TestRecentUsageIndependentlyTrimsAccountMetricsAcrossPages(t *testing.T) {
 	sealed := window.QualityWindows[0]
 	if sealed.FirstSample != since.Format(time.RFC3339Nano)+":91" ||
 		sealed.LastSample != shared.Format(time.RFC3339Nano)+":124" || sealed.Requests != 20 ||
-		sealed.CacheRatio == nil || *sealed.CacheRatio != .5 || sealed.FirstTokenSamples != 20 ||
+		sealed.CacheRatio == nil || *sealed.CacheRatio != .495 || sealed.FirstTokenSamples != 20 ||
 		sealed.AverageFirstTokenMs == nil || *sealed.AverageFirstTokenMs != 200 ||
 		sealed.ExcludedSmallRequests != 0 || sealed.ExcludedUnknownRequests != 0 {
-		t.Fatalf("incorrect timeline or independently trimmed cache and TTFT: %+v", sealed)
+		t.Fatalf("incorrect timeline, all-sample cache mean, or trimmed TTFT: %+v", sealed)
 	}
 	if window.Requests != 20 || window.FirstTokenSamples != 20 || window.CacheRatio == nil || *window.CacheRatio != *sealed.CacheRatio ||
 		window.AverageFirstTokenMs == nil || *window.AverageFirstTokenMs != *sealed.AverageFirstTokenMs {
@@ -236,7 +236,7 @@ func TestRecentUsageIndependentlyTrimsAccountMetricsAcrossPages(t *testing.T) {
 		model, typ  string
 		count       int
 		ratio, ttft float64
-	}{{"a", "stream", 4, .25, 5050}, {"a", "sync", 6, 40000.0 / 240000, 100}, {"b", "ws_v2", 10, .8, 240}}
+	}{{"a", "stream", 4, .25, 5050}, {"a", "sync", 6, 40000.0 / 240000, 100}, {"b", "ws_v2", 10, .79, 240}}
 	if len(sealed.Models) != len(want) {
 		t.Fatalf("expected exactly three diagnostic model/type groups: %+v", sealed.Models)
 	}

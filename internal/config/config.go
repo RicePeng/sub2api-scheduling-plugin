@@ -16,6 +16,7 @@ type Rule struct {
 	MaxRateMultiplier               float64 `json:"max_rate_multiplier"`
 	MinCacheRatio                   float64 `json:"min_cache_ratio"`
 	MaxAverageFirstTokenMs          float64 `json:"max_average_first_token_ms"`
+	FirstTokenPeriods               int     `json:"first_token_periods"`
 	ExclusiveRateBelow              float64 `json:"exclusive_rate_below"`
 	ExclusiveMinCacheRatio          float64 `json:"exclusive_min_cache_ratio"`
 	ExclusiveMaxAverageFirstTokenMs float64 `json:"exclusive_max_average_first_token_ms"`
@@ -33,6 +34,7 @@ type Rule struct {
 
 // QualityWindowRequests is the fixed sample size for recent usage and quality rules.
 const QualityWindowRequests = 20
+const DefaultFirstTokenPeriods = 5
 
 const DefaultMinInputTokens int64 = 40000
 const MaxMinInputTokens int64 = 1000000000
@@ -73,7 +75,7 @@ func DefaultGroupPriorities() map[string]int {
 }
 
 func defaultRule() Rule {
-	return Rule{MaxRateMultiplier: .2, MinCacheRatio: .8, MaxAverageFirstTokenMs: 10000, ExclusiveRateBelow: .05,
+	return Rule{MaxRateMultiplier: .2, MinCacheRatio: .8, MaxAverageFirstTokenMs: 10000, FirstTokenPeriods: DefaultFirstTokenPeriods, ExclusiveRateBelow: .05,
 		ExclusiveMinCacheRatio: .8, ExclusiveMaxAverageFirstTokenMs: 10000,
 		MinRequests: QualityWindowRequests, MinInputTokens: DefaultMinInputTokens,
 		TriggerSamples: 2, RecoverySamples: 2, ConfirmationSeconds: 180, RecoverySeconds: 300,
@@ -302,6 +304,9 @@ func NormalizeRule(r Rule) Rule {
 	if r.MinInputTokens == 0 {
 		r.MinInputTokens = d.MinInputTokens
 	}
+	if r.FirstTokenPeriods == 0 {
+		r.FirstTokenPeriods = d.FirstTokenPeriods
+	}
 	if r.TriggerSamples == 0 {
 		r.TriggerSamples = d.TriggerSamples
 	}
@@ -348,6 +353,9 @@ func validateRule(r Rule) error {
 	}
 	if r.MinRequests != QualityWindowRequests {
 		return fmt.Errorf("调用窗口固定为 %d 次；旧版调用样本数配置须为 1–20", QualityWindowRequests)
+	}
+	if r.FirstTokenPeriods < 1 || r.FirstTokenPeriods > 20 {
+		return errors.New("平均首字时间周期须为 1–20 个窗口")
 	}
 	if r.MinInputTokens < 1 || r.MinInputTokens > MaxMinInputTokens {
 		return fmt.Errorf("最小输入上下文须为 1–%d token", MaxMinInputTokens)

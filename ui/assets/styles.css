@@ -134,10 +134,9 @@ h1 { margin-top: 6px; font-size: 25px; line-height: 1.25; font-weight: 660; }
 .monitor-current-sampling { margin-top: 5px; color: var(--muted); font-size: 10px; }
 .monitor-current-sampling summary { color: var(--green); cursor: pointer; }
 .monitor-current-sampling > small { display: block; margin-top: 2px; }
-.monitor-period-cache { display: flex; flex-wrap: wrap; align-items: baseline; gap: 5px 8px; }
-.monitor-period-cache .monitor-cache { flex-wrap: wrap; }
-.monitor-period-cache .monitor-window-label { margin: 0; }
-.monitor-period-cache .monitor-history-toggle { flex-basis: 100%; margin-top: 1px; }
+.monitor-period-cell { vertical-align: top; }
+.monitor-period-cell .monitor-window-label { margin: 0; }
+.monitor-period-cell .monitor-history-toggle { display: block; margin-top: 5px; }
 .monitor-history-row td { background: color-mix(in srgb, var(--surface-alt) 45%, transparent); }
 .monitor-status { padding: 4px 7px; border: 1px solid var(--line); border-radius: 4px; background: var(--surface-alt); color: var(--muted); font-size: 11px; white-space: nowrap; }
 .monitor-status:hover { text-decoration: underline; }
@@ -185,13 +184,14 @@ h1 { margin-top: 6px; font-size: 25px; line-height: 1.25; font-weight: 660; }
 .overview-heading { display: grid; gap: 2px; min-width: 130px; }
 .overview-heading h3 { font-size: 12px; font-weight: 650; }
 .overview-heading span { color: var(--muted); font-size: 10px; }
-.overview-metrics { display: grid; grid-template-columns: repeat(4, minmax(82px, 1fr)); width: min(100%, 620px); margin: 0; }
+.overview-metrics { display: grid; grid-template-columns: repeat(5, minmax(82px, 1fr)); width: min(100%, 720px); margin: 0; }
 .overview-stat { display: flex; align-items: baseline; justify-content: center; gap: 9px; padding: 2px 12px; border-left: 1px solid var(--line); }
 .overview-stat dt { color: var(--muted); font-size: 10px; white-space: nowrap; }
 .overview-stat dd { color: var(--ink); font-size: 15px; font-weight: 680; font-variant-numeric: tabular-nums; }
 .overview-stat.callable dd { color: var(--green); }
 .overview-stat.exceptional dd { color: var(--danger); }
 .overview-stat.needs-rate dd { color: var(--gold); }
+.overview-stat.overall dd { color: var(--blue); }
 
 .groups-list { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); align-items: start; gap: 12px; }
 .group-section { border: 1px solid var(--line); border-left: 3px solid var(--group-color, var(--green)); border-radius: var(--radius); background: var(--surface); }
@@ -215,7 +215,7 @@ h1 { margin-top: 6px; font-size: 25px; line-height: 1.25; font-weight: 660; }
 .group-settings-summary { margin: 0 16px 10px; padding: 8px 10px; border-radius: 4px; background: var(--surface-alt); color: var(--muted); font-size: 11px; line-height: 1.7; overflow-wrap: anywhere; }
 .group-rule-card .rule-section-head { flex-wrap: wrap; }
 .account-row.dragging { opacity: .45; }
-.account-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 8px 12px; min-height: 54px; padding: 8px 10px; border-top: 1px solid #edf0ed; }
+.account-row { display: grid; grid-template-columns: minmax(0, 1fr) auto auto; align-items: center; gap: 8px 12px; min-height: 54px; padding: 8px 10px; border-top: 1px solid #edf0ed; }
 .account-identity { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .account-identity > span:last-child { min-width: 0; }
 .account-drag-grip { width: 20px; height: 27px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 3px; background: #f0f3f0; color: #758278; cursor: grab; font-size: 15px; }
@@ -229,7 +229,7 @@ h1 { margin-top: 6px; font-size: 25px; line-height: 1.25; font-weight: 660; }
 .rate-pair.fixed { background: var(--blue-soft); color: var(--blue); }
 .rate-pair.default { flex-wrap: wrap; max-width: 100%; background: var(--gold-soft); color: var(--gold); white-space: normal; }
 .rate-pair.unknown { background: var(--surface-alt); color: var(--muted); }
-.account-actions { grid-column: 1 / -1; display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; white-space: nowrap; }
+.account-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; min-width: 0; white-space: nowrap; }
 .row-edit, .row-remove { min-height: 30px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: white; color: var(--muted); font-size: 11px; }
 .row-schedule { min-height: 30px; padding: 4px 8px; border: 1px solid var(--line); border-radius: 4px; background: white; font-size: 11px; }
 .row-schedule.on { border-color: #b9dbcb; background: var(--green-soft); color: var(--green); }

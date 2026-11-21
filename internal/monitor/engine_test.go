@@ -20,6 +20,24 @@ type memoryStore struct {
 	historyWriteError bool
 }
 
+type failFallbackIntentStore struct {
+	*memoryStore
+	failed bool
+}
+
+func (s *failFallbackIntentStore) Set(ctx context.Context, key string, value []byte) error {
+	var ledger Ledger
+	if key == "actions" && !s.failed && json.Unmarshal(value, &ledger) == nil {
+		for _, record := range ledger.Records {
+			if record != nil && record.FallbackPending {
+				s.failed = true
+				return errors.New("one-time fallback intent failure")
+			}
+		}
+	}
+	return s.memoryStore.Set(ctx, key, value)
+}
+
 func (s *memoryStore) Get(_ context.Context, key string) ([]byte, error) {
 	if key == "actions" {
 		return append([]byte{}, s.raw...), nil
@@ -159,6 +177,13 @@ func setup(t *testing.T, accounts ...adminapi.Account) (*Engine, config.Config, 
 	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
 	api := &fakeAPI{accounts: map[int64]adminapi.Account{}, usage: map[int64]adminapi.Window{}}
 	c := config.Defaults()
+	// Existing scheduler fixtures exercise single-window cache and TTFT rules.
+	// Production defaults intentionally use five independent TTFT periods.
+	c.Rule.FirstTokenPeriods = 1
+	for group, rule := range c.GroupRules {
+		rule.FirstTokenPeriods = 1
+		c.GroupRules[group] = rule
+	}
 	c.AdminURL, c.AdminAPIKey, c.ExecutorHostname = "http://test/api/v1", "test-key", "node-a"
 	c.AutomationEnabled = true
 	for _, a := range accounts {
@@ -433,6 +458,119 @@ func TestAccountReadFailureBlocksOnlyItsPlatform(t *testing.T) {
 	if api.accounts[8].Schedulable || !api.accounts[9].Schedulable || api.accounts[10].Schedulable ||
 		snapshotAccount(t, e, 7).State != "unknown" || snapshotAccount(t, e, 8).State != "group_wait" {
 		t.Fatalf("read uncertainty escaped its platform or opened an unsafe same-platform group: %+v", e.Snapshot().Accounts)
+	}
+}
+
+func TestMonitoringSummaryRequiresConfirmedAccountState(t *testing.T) {
+	c := config.Defaults()
+	now := time.Date(2026, 11, 18, 12, 0, 0, 0, time.UTC)
+	item := &managedAccount{selected: true, readOK: true,
+		account: adminapi.Account{ID: 7, Type: "apikey", Status: "active", Schedulable: true},
+		row:     AccountStatus{ID: 7, State: "ready", Schedulable: true}}
+	if state, _ := monitoringSummary(&Ledger{}, c, []*managedAccount{item}, 0, now); state != "stable" {
+		t.Fatalf("confirmed account was not reported stable: %s", state)
+	}
+	item.row.State = "account_error"
+	if state, _ := monitoringSummary(&Ledger{}, c, []*managedAccount{item}, 0, now); state != "unknown" {
+		t.Fatalf("host account error was reported as %s", state)
+	}
+	item.row.State = "ready"
+	item.record = &ActionRecord{PendingField: "schedulable"}
+	if state, _ := monitoringSummary(&Ledger{}, c, []*managedAccount{item}, 0, now); state != "unknown" {
+		t.Fatalf("unconfirmed write was reported as %s", state)
+	}
+}
+
+func TestFallbackRecoveryTriggersOnceFromEarliestValidGroup(t *testing.T) {
+	e, c, api, store, now := setup(t, account(7, "openai", "apikey", 6, false),
+		account(8, "openai", "apikey", 7, false), account(9, "openai", "apikey", 9, true))
+	c.AccountSettings[0].Group, c.AccountSettings[1].Group, c.AccountSettings[2].Group = "excellent", "good", "reserve"
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	e.Cycle(ctx, now)
+	hold := now.Add(time.Hour)
+	ledger := ledgerOf(t, store)
+	for _, id := range []string{"7", "8"} {
+		r := ledger.Records[id]
+		r.FailureKind, r.HoldUntil, r.TargetSchedulable = "quality", &hold, false
+	}
+	if err := save(ctx, store, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	host := api.accounts[7]
+	host.Schedulable = false
+	api.accounts[7] = host
+	e.Cycle(ctx, now.Add(time.Minute))
+	if !api.accounts[9].Schedulable {
+		t.Fatal("healthy reserve did not open")
+	}
+	host = api.accounts[9]
+	host.Status = "error" // The host rejects routing even if the switch remains on.
+	api.accounts[9] = host
+	api.accountErrors = map[int64]error{8: errors.New("read unavailable")}
+	e.Cycle(ctx, now.Add(2*time.Minute))
+	if e.Snapshot().OverallState != "unknown" || ledgerOf(t, store).FallbackTriggered || api.accounts[7].Schedulable {
+		t.Fatal("uncertain host state consumed the emergency retry")
+	}
+	delete(api.accountErrors, 8)
+	at := now.Add(3 * time.Minute)
+	api.ignoreWrite = true
+	e.Cycle(ctx, at)
+	ledger = ledgerOf(t, store)
+	if ledger.FallbackTriggered || !ledger.Records["7"].FallbackPending || ledger.Records["7"].PendingField != "schedulable" || api.accounts[7].Schedulable {
+		t.Fatalf("unconfirmed fallback open was consumed or lost: ledger=%+v host=%+v", ledger, api.accounts[7])
+	}
+	api.ignoreWrite = false
+	at = at.Add(time.Minute)
+	e.Cycle(ctx, at)
+	ledger, status := ledgerOf(t, store), e.Snapshot()
+	if !status.FallbackTriggered || status.OverallState != "anomaly_detected" || !api.accounts[7].Schedulable ||
+		api.accounts[7].Priority != c.GroupPriorities["excellent"] || api.accounts[8].Schedulable || api.clearCalls != 0 ||
+		ledger.Records["7"].RecoveryStartedAt == nil || !ledger.Records["7"].RecoveryStartedAt.Equal(at) {
+		t.Fatalf("fallback did not start the earliest valid group at its original priority: %+v", status)
+	}
+	host = api.accounts[7]
+	host.Status = "error"
+	api.accounts[7] = host
+	restarted := restartMonitor(t, e, c, store, at.Add(time.Minute))
+	restarted.Cycle(ctx, at.Add(time.Minute))
+	status = restarted.Snapshot()
+	if status.OverallState != "anomaly_detected" || status.FallbackAt == nil || !status.FallbackAt.Equal(at) || api.accounts[8].Schedulable {
+		t.Fatal("restarting the process re-armed the one-shot fallback or lost the warning")
+	}
+}
+
+func TestFallbackDoesNotStartSecondRecoveryWhileTrialIsActive(t *testing.T) {
+	e, c, api, store, now := setup(t, account(7, "openai", "apikey", 6, true),
+		account(8, "openai", "apikey", 7, false), account(9, "openai", "apikey", 9, true))
+	c.AccountSettings[0].Group, c.AccountSettings[1].Group, c.AccountSettings[2].Group = "excellent", "good", "reserve"
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	e.Cycle(context.Background(), now)
+
+	ledger := ledgerOf(t, store)
+	trialStarted, trialDeadline, hold := now, now.Add(15*time.Minute), now.Add(time.Hour)
+	trial := ledger.Records["7"]
+	trial.FailureKind, trial.RecoveryTrial = "quality", true
+	trial.RecoveryStartedAt, trial.RecoveryDeadline = &trialStarted, &trialDeadline
+	waiting := ledger.Records["8"]
+	waiting.FailureKind, waiting.HoldUntil, waiting.TargetSchedulable = "quality", &hold, false
+	if err := save(context.Background(), store, &ledger); err != nil {
+		t.Fatal(err)
+	}
+	tail := api.accounts[9]
+	tail.Status = "error"
+	api.accounts[9] = tail
+
+	e.Cycle(context.Background(), now.Add(time.Minute))
+	ledger, status := ledgerOf(t, store), e.Snapshot()
+	if ledger.FallbackTriggered || !api.accounts[7].Schedulable || api.accounts[8].Schedulable ||
+		ledger.Records["7"].RecoveryStartedAt == nil || status.FallbackTriggered {
+		t.Fatalf("terminal failure started a second recovery or displaced the active trial: status=%+v ledger=%+v accounts=%+v",
+			status, ledger, api.accounts)
 	}
 }
 
@@ -719,8 +857,15 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 			if err := e.Apply(c); err != nil {
 				t.Fatal(err)
 			}
-			healthy := adminapi.Window{Complete: true, Requests: 20, CacheRatio: ptr(.9), AverageFirstTokenMs: ptr(500), FirstTokenSamples: 20}
-			api.usage[7], api.usage[8] = healthy, healthy
+			healthy := adminapi.Window{Complete: true, Requests: 20, CacheRatio: ptr(.9),
+				QualityCurrent: &adminapi.QualityWindow{WindowKnown: true}}
+			withTTFT := func(w adminapi.Window, at time.Time, ms float64, samples int) adminapi.Window {
+				b := qualityWindow(at, 1, "m", "stream", .9)
+				b.AverageFirstTokenMs, b.FirstTokenSamples = ptr(ms), samples
+				w.QualityWindows = []adminapi.QualityWindow{b}
+				return w
+			}
+			api.usage[7], api.usage[8] = withTTFT(healthy, now, 500, 20), healthy
 			e.Cycle(context.Background(), now)
 			if !api.accounts[7].Schedulable || api.accounts[8].Schedulable {
 				t.Fatal("test did not start with a single exclusive account")
@@ -728,8 +873,7 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 			w := healthy
 			w.Requests, w.Complete = tc.requests, tc.complete
 			w.CacheRatio = ptr(tc.ratio)
-			w.AverageFirstTokenMs, w.FirstTokenSamples = ptr(tc.ttft), tc.ttftSamples
-			api.usage[7] = w
+			api.usage[7] = withTTFT(w, now.Add(time.Minute), tc.ttft, tc.ttftSamples)
 			e.Cycle(context.Background(), now.Add(time.Minute))
 			if !api.accounts[7].Schedulable || api.accounts[8].Schedulable != tc.exits || ledgerOf(t, store).Records["7"].HoldUntil != nil {
 				t.Fatalf("exclusive exit paused an otherwise eligible account or failed to reopen the group: first=%+v second=%+v", api.accounts[7], api.accounts[8])
@@ -737,7 +881,7 @@ func TestExclusiveExitUsesIndependentCacheAndTTFTThresholds(t *testing.T) {
 			if tc.exits && !strings.Contains(snapshotAccount(t, e, 7).Reason, "退出独占") {
 				t.Fatal("exclusive exit reason was not exposed")
 			}
-			api.usage[7] = healthy
+			api.usage[7] = withTTFT(healthy, now.Add(2*time.Minute), 500, 20)
 			e.Cycle(context.Background(), now.Add(2*time.Minute))
 			if api.accounts[8].Schedulable {
 				t.Fatal("recovered exclusive metrics did not restore exclusivity")
@@ -848,7 +992,7 @@ func TestCooldownRetriesWithoutImmediatelyReusingTriggeringSamples(t *testing.T)
 	}
 }
 
-func TestUnconfirmedClosureBlocksOpeningNextGroupAndRestartReconciles(t *testing.T) {
+func TestUnconfirmedFallbackOpenKeepsCurrentGroupUntilRestartReconciles(t *testing.T) {
 	e, c, api, store, now := setup(t, account(7, "openai", "apikey", 5, true), account(8, "openai", "apikey", 5, true))
 	c.AccountSettings[0].Group, c.AccountSettings[1].Group = "excellent", "good"
 	if err := e.Apply(c); err != nil {
@@ -860,8 +1004,9 @@ func TestUnconfirmedClosureBlocksOpeningNextGroupAndRestartReconciles(t *testing
 	a.RateLimitResetAt = &until
 	api.accounts[7], api.ignoreWrite = a, true
 	e.Cycle(context.Background(), now.Add(time.Minute))
-	if api.accounts[8].Schedulable || ledgerOf(t, store).Records["7"].PendingField != "schedulable" {
-		t.Fatal("opened next group before closure was confirmed")
+	if !api.accounts[7].Schedulable || api.accounts[8].Schedulable ||
+		ledgerOf(t, store).Records["8"].PendingField != "schedulable" {
+		t.Fatal("unconfirmed fallback open did not preserve the serving account")
 	}
 	api.ignoreWrite = false
 	restarted := New("test", "node-a")
@@ -874,6 +1019,69 @@ func TestUnconfirmedClosureBlocksOpeningNextGroupAndRestartReconciles(t *testing
 	restarted.Cycle(context.Background(), now.Add(2*time.Minute))
 	if api.accounts[7].Schedulable || !api.accounts[8].Schedulable {
 		t.Fatal("restart failed to reconcile pending closure and fail over")
+	}
+}
+
+func TestDelayedOpenRemainsOwnedUntilStopCanCloseIt(t *testing.T) {
+	e, c, api, store, now := setup(t, account(7, "openai", "apikey", 8, false))
+	api.ignoreWrite = true
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	e.Cycle(context.Background(), now)
+	if api.accounts[7].Schedulable || ledgerOf(t, store).Records["7"].PendingSchedulable != true {
+		t.Fatal("test did not establish an unconfirmed host open")
+	}
+	c.AutomationEnabled = false
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	e.Cycle(context.Background(), now.Add(time.Minute))
+	if ledgerOf(t, store).Records["7"] == nil {
+		t.Fatal("stop discarded ownership while an open write was unresolved")
+	}
+	late := api.accounts[7]
+	late.Schedulable = true
+	api.accounts[7], api.ignoreWrite = late, false
+	e.Cycle(context.Background(), now.Add(2*time.Minute))
+	if api.accounts[7].Schedulable || ledgerOf(t, store).Records["7"] != nil {
+		t.Fatalf("late open was not closed during restoration: host=%+v ledger=%+v", api.accounts[7], ledgerOf(t, store))
+	}
+}
+
+func TestFallbackIntentStorageFailureDoesNotConsumeOneShot(t *testing.T) {
+	e, c, api, store, now := setup(t, account(7, "openai", "apikey", 6, true),
+		account(8, "openai", "apikey", 9, true))
+	c.AccountSettings[0].Group, c.AccountSettings[1].Group = "excellent", "general"
+	configureQuality(&c, "excellent", .8, 0)
+	if err := e.Apply(c); err != nil {
+		t.Fatal(err)
+	}
+	e.Cycle(context.Background(), now)
+	for i, seconds := range []int{180, 360} {
+		at := now.Add(time.Duration(seconds) * time.Second)
+		qualityCycle(e, api, at, 7, qualityWindow(at, 100+i*20, "m", "sync", .2))
+	}
+	if !api.accounts[8].Schedulable {
+		t.Fatal("terminal general account did not become active")
+	}
+	tail := api.accounts[8]
+	tail.Status = "error"
+	api.accounts[8] = tail
+	writes := api.writes
+	intentStore := &failFallbackIntentStore{memoryStore: store}
+	e.SetStore(intentStore)
+	e.Cycle(context.Background(), now.Add(7*time.Minute))
+	ledger := ledgerOf(t, store)
+	if !intentStore.failed || ledger.FallbackTriggered || ledger.Records["7"].FallbackPending ||
+		api.accounts[7].Schedulable != false || api.writes != writes {
+		t.Fatalf("failed fallback intent was consumed or sent to host: ledger=%+v host=%+v writes=%d/%d",
+			ledger, api.accounts[7], api.writes, writes)
+	}
+	e.Cycle(context.Background(), now.Add(8*time.Minute))
+	ledger = ledgerOf(t, store)
+	if !ledger.FallbackTriggered || !api.accounts[7].Schedulable {
+		t.Fatalf("fallback did not retry after storage recovered: ledger=%+v host=%+v", ledger, api.accounts[7])
 	}
 }
 
